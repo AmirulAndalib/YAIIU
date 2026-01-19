@@ -38,7 +38,6 @@ class SharedSettings {
         }
         set {
             userDefaults?.set(newValue, forKey: serverURLKey)
-            userDefaults?.synchronize()
         }
     }
     
@@ -49,7 +48,6 @@ class SharedSettings {
         }
         set {
             userDefaults?.set(newValue, forKey: internalServerURLKey)
-            userDefaults?.synchronize()
         }
     }
     
@@ -60,7 +58,6 @@ class SharedSettings {
         }
         set {
             userDefaults?.set(newValue, forKey: internalNetworkSSIDKey)
-            userDefaults?.synchronize()
         }
     }
     
@@ -79,7 +76,6 @@ class SharedSettings {
         }
         set {
             userDefaults?.set(newValue, forKey: isLoggedInKey)
-            userDefaults?.synchronize()
         }
     }
     
@@ -91,7 +87,6 @@ class SharedSettings {
         }
         set {
             userDefaults?.set(newValue, forKey: backgroundUploadEnabledKey)
-            userDefaults?.synchronize()
         }
     }
     
@@ -103,7 +98,6 @@ class SharedSettings {
         }
         set {
             userDefaults?.set(newValue, forKey: lastProcessedChangeTokenKey)
-            userDefaults?.synchronize()
         }
     }
     
@@ -118,7 +112,6 @@ class SharedSettings {
         }
         set {
             userDefaults?.set(Array(newValue), forKey: uploadedAssetIdentifiersKey)
-            userDefaults?.synchronize()
         }
     }
     
