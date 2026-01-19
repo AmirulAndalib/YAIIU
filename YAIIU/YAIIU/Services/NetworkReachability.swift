@@ -120,13 +120,14 @@ final class NetworkReachability: NSObject, ObservableObject {
         #if targetEnvironment(simulator)
         completion(nil)
         #else
-        if let ssid = fetchSSIDViaCNCopy() {
-            completion(ssid)
-            return
-        }
         
         NEHotspotNetwork.fetchCurrent { network in
-            completion(network?.ssid)
+            if let ssid = network?.ssid {
+                completion(ssid)
+            } else {
+                // Fallback to deprecated method for older iOS versions if needed
+                completion(self.fetchSSIDViaCNCopy())
+            }
         }
         #endif
     }
