@@ -294,10 +294,15 @@ final class BackgroundUploadExtension: PHBackgroundResourceUploadExtension {
             return nil
         }
 
-        let asset = fetchAsset(for: resource)
-        let created = asset?.creationDate ?? Date()
-        let modified = asset?.modificationDate ?? Date()
-        let isFavorite = asset?.isFavorite ?? false
+        // Ensure we can fetch the asset; skip if not found to avoid incorrect metadata
+        guard let asset = fetchAsset(for: resource) else {
+            logWarning("Could not fetch asset for resource: \(resource.originalFilename), skipping upload")
+            return nil
+        }
+        
+        let created = asset.creationDate ?? Date()
+        let modified = asset.modificationDate ?? Date()
+        let isFavorite = asset.isFavorite
         
         // Use device's current timezone for background extension
         // Note: We cannot use CLGeocoder in background extension due to strict execution time limits
