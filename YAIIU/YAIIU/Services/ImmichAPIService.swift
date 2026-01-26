@@ -184,11 +184,14 @@ class ImmichAPIService: NSObject {
         dateFormatter.timeZone = timezone ?? TimeZone.current
         
         // Write form fields
+        struct MultipartEncodingError: Error {}
+
         func writeField(name: String, value: String) throws {
             let fieldData = "--\(boundary)\r\nContent-Disposition: form-data; name=\"\(name)\"\r\n\r\n\(value)\r\n"
-            if let data = fieldData.data(using: .utf8) {
-                try handle.write(contentsOf: data)
+            guard let data = fieldData.data(using: .utf8) else {
+                throw MultipartEncodingError()
             }
+            try handle.write(contentsOf: data)
         }
         
         try writeField(name: "deviceAssetId", value: deviceAssetId)

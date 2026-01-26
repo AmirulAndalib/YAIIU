@@ -330,8 +330,13 @@ class UploadManager: ObservableObject {
                     try? FileManager.default.removeItem(at: fileURL)
                 }
                 
+                struct FileAttributeError: Error { case missingSize }
                 let fileAttrs = try FileManager.default.attributesOfItem(atPath: fileURL.path)
-                uploadedFileSize = (fileAttrs[.size] as? Int64) ?? 0
+                guard let fileSize = fileAttrs[.size] as? Int64 else {
+                    logError("Could not determine file size for \(fileURL.path)", category: .upload)
+                    throw FileAttributeError.missingSize
+                }
+                uploadedFileSize = fileSize
                 
                 response = try await ImmichAPIService.shared.uploadAssetFromFile(
                     fileURL: fileURL,

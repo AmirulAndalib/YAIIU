@@ -192,8 +192,8 @@ class PhotoLibraryManager: ObservableObject {
     /// Exports a resource to a temporary file for memory-efficient large file handling.
     func exportResourceToFile(for resource: PHAssetResource) async throws -> URL {
         let tempDir = FileManager.default.temporaryDirectory
-        let filename = resource.originalFilename
-        let fileURL = tempDir.appendingPathComponent(UUID().uuidString + "_" + filename)
+        let sanitizedFilename = resource.originalFilename.replacingOccurrences(of: "/", with: "_")
+        let fileURL = tempDir.appendingPathComponent(UUID().uuidString + "_" + sanitizedFilename)
         
         // Remove any existing file at the path
         try? FileManager.default.removeItem(at: fileURL)
