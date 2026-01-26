@@ -201,11 +201,12 @@ class PhotoLibraryManager: ObservableObject {
         let options = PHAssetResourceRequestOptions()
         options.isNetworkAccessAllowed = true
         
-        class CancellationFlag {
+        actor CancellationFlag {
             var isCancelled = false
+            func cancel() { isCancelled = true }
         }
         let cancellationFlag = CancellationFlag()
-
+        
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 PHAssetResourceManager.default().writeData(
@@ -213,18 +214,20 @@ class PhotoLibraryManager: ObservableObject {
                     toFile: fileURL,
                     options: options
                 ) { error in
-                    if cancellationFlag.isCancelled { return }
-                    if let error = error {
-                        try? FileManager.default.removeItem(at: fileURL)
-                        continuation.resume(throwing: error)
-                    } else {
-                        continuation.resume(returning: fileURL)
+                    Task {
+                        if await cancellationFlag.isCancelled { return }
+                        if let error = error {
+                            try? FileManager.default.removeItem(at: fileURL)
+                            continuation.resume(throwing: error)
+                        } else {
+                            continuation.resume(returning: fileURL)
+                        }
                     }
                 }
             }
-            } onCancel: {
-                cancellationFlag.isCancelled = true
-            }
+        } onCancel: {
+            Task { await cancellationFlag.cancel() }
+        }
     }
     
     /// Checks if a resource should use file-based export (for large files like videos).
