@@ -201,7 +201,8 @@ class ImmichAPIService: NSObject {
         try writeField(name: "isFavorite", value: String(isFavorite))
         
         // Write file header
-        let fileHeader = "--\(boundary)\r\nContent-Disposition: form-data; name=\"assetData\"; filename=\"\(filename)\"\r\nContent-Type: \(mimeType)\r\n\r\n"
+        let sanitizedFilename = filename.replacingOccurrences(of: "\"", with: "_")
+        let fileHeader = "--\(boundary)\r\nContent-Disposition: form-data; name=\"assetData\"; filename=\"\(sanitizedFilename)\"\r\nContent-Type: \(mimeType)\r\n\r\n"
         if let headerData = fileHeader.data(using: .utf8) {
             try handle.write(contentsOf: headerData)
         }
