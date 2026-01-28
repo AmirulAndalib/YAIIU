@@ -57,42 +57,50 @@ class ServerAssetSyncService {
         progressHandler: ((SyncProgress) -> Void)? = nil,
         completion: @escaping (Result<SyncResult, Error>) -> Void
     ) {
-        syncQueue.async { [weak self] in
+        Task.detached(priority: .utility) { [weak self] in
             guard let self = self else {
-                DispatchQueue.main.async {
+                await MainActor.run {
                     completion(.failure(SyncError.syncFailed(reason: "Service deallocated")))
                 }
                 return
             }
             
-            guard !self.isSyncing else {
-                logWarning("Sync already in progress, skipping", category: .sync)
-                DispatchQueue.main.async {
+            let shouldProceed = self.syncQueue.sync { () -> Bool in
+                guard !self.isSyncing else {
+                    logWarning("Sync already in progress, skipping", category: .sync)
+                    return false
+                }
+                self.isSyncing = true
+                return true
+            }
+            
+            guard shouldProceed else {
+                await MainActor.run {
                     completion(.failure(SyncError.syncInProgress))
                 }
                 return
             }
             
-            self.isSyncing = true
+            defer {
+                self.syncQueue.sync { self.isSyncing = false }
+            }
             
-            Task {
-                do {
-                    let result = try await self.performSync(
-                        serverURL: serverURL,
-                        apiKey: apiKey,
-                        forceFullSync: forceFullSync,
-                        progressHandler: progressHandler
-                    )
-                    self.isSyncing = false
-                    DispatchQueue.main.async {
-                        completion(.success(result))
-                    }
-                } catch {
-                    self.isSyncing = false
-                    logError("Sync failed: \(error.localizedDescription)", category: .sync)
-                    DispatchQueue.main.async {
-                        completion(.failure(error))
-                    }
+            do {
+                let result = try await self.performSync(
+                    serverURL: serverURL,
+                    apiKey: apiKey,
+                    forceFullSync: forceFullSync,
+                    progressHandler: progressHandler
+                )
+                
+                await MainActor.run {
+                    completion(.success(result))
+                }
+            } catch {
+                logError("Sync failed: \(error.localizedDescription)", category: .sync)
+                
+                await MainActor.run {
+                    completion(.failure(error))
                 }
             }
         }
