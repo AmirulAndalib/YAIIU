@@ -281,7 +281,16 @@ struct PhotoGridView: View {
     }
     
     private func startBackgroundProcessing() {
-        guard photoLibraryManager.assetCount > 0 else { return }
+        guard photoLibraryManager.assetCount > 0 else {
+            if hashManager.isProcessing {
+                hashManager.clearPreparingState()
+            }
+            return
+        }
+        
+        if !hashManager.isProcessing {
+            hashManager.setPreparingState()
+        }
         
         let manager = photoLibraryManager
         Task.detached(priority: .utility) {
@@ -459,7 +468,7 @@ struct PhotoGridView: View {
             }
             Spacer()
             Button {
-                currentFilter = .all
+                applyFilter(.all)
             } label: {
                 Image(systemName: "xmark.circle.fill")
                     .foregroundColor(.secondary)
@@ -509,6 +518,9 @@ struct PhotoGridView: View {
         
         if filter == .notUploaded {
             refreshFilterCache()
+        } else {
+            // Force grid rebuild when switching back to "all"
+            refreshToken = UUID()
         }
     }
     
@@ -519,15 +531,20 @@ struct PhotoGridView: View {
         filterCacheVersion += 1
         let currentVersion = filterCacheVersion
         
-        let totalCount = photoLibraryManager.assetCount
-        let statusCache = hashManager.syncStatusCache
         let manager = photoLibraryManager
+        let hash = hashManager
         
+        // Capture statusCache inside the Task to get the latest snapshot
         Task.detached(priority: .userInitiated) {
+            // Read latest values atomically to ensure consistency
+            let (statusCache, totalCount, fetchResult) = await MainActor.run {
+                (hash.syncStatusCache, manager.assetCount, manager.fetchResult)
+            }
+            
             var indices: [Int] = []
             indices.reserveCapacity(totalCount / 4)
             
-            if let fetchResult = manager.fetchResult {
+            if let fetchResult = fetchResult {
                 fetchResult.enumerateObjects { (asset, index, _) in
                     let status = statusCache[asset.localIdentifier] ?? .pending
                     if status != .uploaded {
@@ -542,20 +559,29 @@ struct PhotoGridView: View {
                 self.filteredIndices = indices
                 self.cachedNotUploadedCount = indices.count
                 self.isFilteringInProgress = false
+                // Force grid rebuild to display correct thumbnails
+                self.refreshToken = UUID()
             }
         }
     }
     
     private func updateNotUploadedCount() {
-        let totalCount = photoLibraryManager.assetCount
-        let statusCache = hashManager.syncStatusCache
-        
-        guard let fetchResult = photoLibraryManager.fetchResult else {
-            cachedNotUploadedCount = totalCount
-            return
-        }
+        let manager = photoLibraryManager
+        let hash = hashManager
         
         Task.detached(priority: .utility) {
+            // Read latest values atomically to ensure consistency
+            let (statusCache, totalCount, fetchResult) = await MainActor.run {
+                (hash.syncStatusCache, manager.assetCount, manager.fetchResult)
+            }
+            
+            guard let fetchResult = fetchResult else {
+                await MainActor.run {
+                    self.cachedNotUploadedCount = totalCount
+                }
+                return
+            }
+            
             var uploadedCount = 0
             fetchResult.enumerateObjects { (asset, _, _) in
                 if statusCache[asset.localIdentifier] == .uploaded {
@@ -712,9 +738,12 @@ struct PhotoGridView: View {
         let serverURL = settingsManager.serverURL
         let apiKey = settingsManager.apiKey
         
+        if !hashManager.isProcessing {
+            hashManager.setPreparingState()
+        }
+        
         guard !serverURL.isEmpty && !apiKey.isEmpty else {
             logDebug("Server sync skipped: server not configured", category: .sync)
-            // Start background processing even without server sync
             startBackgroundProcessing()
             return
         }
@@ -800,15 +829,15 @@ private struct PhotoGridItemView: View {
             onLongPress()
         }
         .onAppear {
-            let newAsset = photoLibraryManager.asset(at: assetIndex)
-            asset = newAsset
-            if let id = newAsset?.localIdentifier {
-                syncStatus = hashManager.getSyncStatus(for: id)
-            }
+            loadAsset()
             onAppear()
         }
         .onDisappear {
             onDisappear()
+        }
+        .onChange(of: assetIndex) { _, _ in
+            // Reload asset when index changes (e.g., filter updates)
+            loadAsset()
         }
         .onReceive(hashManager.$syncStatusCache.receive(on: RunLoop.main)) { newCache in
             guard let id = asset?.localIdentifier else { return }
@@ -816,6 +845,14 @@ private struct PhotoGridItemView: View {
             if syncStatus != newStatus {
                 syncStatus = newStatus
             }
+        }
+    }
+    
+    private func loadAsset() {
+        let newAsset = photoLibraryManager.asset(at: assetIndex)
+        asset = newAsset
+        if let id = newAsset?.localIdentifier {
+            syncStatus = hashManager.getSyncStatus(for: id)
         }
     }
 }
