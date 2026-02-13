@@ -11,13 +11,13 @@ final class SQLiteConnection {
     private var isInitialized = false
     private let initLock = NSLock()
     
-    private static let schemaVersion = 2
+    private static let schemaVersion = 3
     
     private init() {
         dbQueue.async { [weak self] in
             self?.openDatabase()
-            self?.migrateIfNeeded()
             self?.createTables()
+            self?.migrateIfNeeded()
             self?.initLock.lock()
             self?.isInitialized = true
             self?.initLock.unlock()
@@ -219,6 +219,8 @@ final class SQLiteConnection {
     }
     
     /// Perform database migrations if needed.
+    /// Tables are always created first via `createTables()`, so migrations
+    /// can safely use ALTER TABLE even on a fresh install.
     private func migrateIfNeeded() {
         let currentVersion = getCurrentSchemaVersion()
         
@@ -226,6 +228,13 @@ final class SQLiteConnection {
             logInfo("Database migration needed: \(currentVersion) -> \(SQLiteConnection.schemaVersion)", category: .database)
             
             if currentVersion < 2 {
+                migrateToV2()
+            }
+            
+            if currentVersion < 3 {
+                // Remediation for users affected by the v2 init ordering bug.
+                // Re-running the v2 migration ensures the column exists.
+                logInfo("Running v3 remediation by ensuring v2 migration logic is complete", category: .database)
                 migrateToV2()
             }
             
