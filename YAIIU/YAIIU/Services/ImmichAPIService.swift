@@ -55,8 +55,8 @@ class ImmichAPIService: NSObject {
         super.init()
         
         let config = URLSessionConfiguration.default
-        config.timeoutIntervalForRequest = 300
-        config.timeoutIntervalForResource = 3600
+        config.timeoutIntervalForRequest = 1800  // 30 minutes
+        config.timeoutIntervalForResource = 7200  // 2 hours total per upload
         // Upload-only session has no use for response caching on disk
         config.urlCache = nil
         config.requestCachePolicy = .reloadIgnoringLocalCacheData
@@ -115,7 +115,7 @@ class ImmichAPIService: NSObject {
         let cloudIdInfo = iCloudId != nil ? ", iCloudId: \(iCloudId!.prefix(20))..." : ""
         logInfo("Starting streaming upload: \(filename) (\(String(format: "%.2f", fileSizeMB)) MB)\(cloudIdInfo)", category: .api)
 
-        let streamBufferSize = 4 * 1024 * 1024
+        let streamBufferSize = 16 * 1024 * 1024
         var readStream: InputStream?
         var writeStream: OutputStream?
         Stream.getBoundStreams(withBufferSize: streamBufferSize, inputStream: &readStream, outputStream: &writeStream)
