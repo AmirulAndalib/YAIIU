@@ -164,6 +164,30 @@ final class BackgroundUploadDatabase {
             exec("DELETE FROM upload_jobs WHERE status = 'completed'")
         }
     }
+
+    func getInflightJobKeys() -> Set<String> {
+        queue.sync {
+            var keys = Set<String>()
+            let sql = """
+                SELECT asset_id, resource_type FROM upload_jobs
+                WHERE status IN ('pending', 'uploading', 'failed')
+            """
+
+            var stmt: OpaquePointer?
+            defer { sqlite3_finalize(stmt) }
+
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return keys }
+
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                guard let aPtr = sqlite3_column_text(stmt, 0),
+                      let tPtr = sqlite3_column_text(stmt, 1) else { continue }
+                let assetId = String(cString: aPtr)
+                let type = String(cString: tPtr)
+                keys.insert("\(assetId)||\(type)")
+            }
+            return keys
+        }
+    }
     
     // MARK: - Uploaded Assets
     
@@ -231,25 +255,6 @@ final class BackgroundUploadDatabase {
             sqlite3_bind_text(stmt, 1, assetId, -1, SQLITE_TRANSIENT)
             
             return sqlite3_step(stmt) == SQLITE_ROW
-        }
-    }
-    
-    func getAllUploadedAssetIds() -> Set<String> {
-        queue.sync {
-            var ids = Set<String>()
-            let sql = "SELECT DISTINCT asset_id FROM uploaded_assets WHERE asset_id IS NOT NULL"
-            
-            var stmt: OpaquePointer?
-            defer { sqlite3_finalize(stmt) }
-            
-            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return ids }
-            
-            while sqlite3_step(stmt) == SQLITE_ROW {
-                if let cStr = sqlite3_column_text(stmt, 0) {
-                    ids.insert(String(cString: cStr))
-                }
-            }
-            return ids
         }
     }
     

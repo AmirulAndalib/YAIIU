@@ -205,52 +205,7 @@ final class UploadRecordRepository {
     }
     
     // MARK: - Fetch Methods
-    
-    func getAllUploadedAssetIds() -> Set<String> {
-        connection.ensureInitialized()
-        var ids: Set<String> = []
-        
-        connection.dbQueue.sync { [weak self] in
-            guard let self = self else { return }
-            ids = self.getAllUploadedAssetIdsInternal()
-        }
-        
-        return ids
-    }
-    
-    func getAllUploadedAssetIdsAsync(completion: @escaping (Set<String>) -> Void) {
-        connection.dbQueue.async { [weak self] in
-            guard let self = self else {
-                DispatchQueue.main.async { completion([]) }
-                return
-            }
-            let ids = self.getAllUploadedAssetIdsInternal()
-            DispatchQueue.main.async {
-                completion(ids)
-            }
-        }
-    }
-    
-    private func getAllUploadedAssetIdsInternal() -> Set<String> {
-        let sql = "SELECT DISTINCT asset_id FROM uploaded_assets WHERE asset_id != '' AND asset_id IS NOT NULL;"
-        var statement: OpaquePointer?
-        var ids: Set<String> = []
-        
-        if sqlite3_prepare_v2(connection.db, sql, -1, &statement, nil) == SQLITE_OK {
-            while sqlite3_step(statement) == SQLITE_ROW {
-                if let cString = sqlite3_column_text(statement, 0) {
-                    let identifier = String(cString: cString)
-                    if !identifier.isEmpty {
-                        ids.insert(identifier)
-                    }
-                }
-            }
-        }
-        
-        sqlite3_finalize(statement)
-        return ids
-    }
-    
+
     func getUploadRecords(for localIdentifier: String) -> [UploadRecord] {
         connection.ensureInitialized()
         var records: [UploadRecord] = []
@@ -379,5 +334,93 @@ final class UploadRecordRepository {
         
         sqlite3_finalize(statement)
         return mappings
+    }
+
+    // MARK: - Backfill Support
+
+    /// Returns a mapping of asset_id → immich_id for all 'unknown' rows that can be resolved
+    /// via a single JOIN across uploaded_assets, hash_cache, and server_assets_cache.
+    func getResolvedImmichIdsFromServerCache() -> [String: String] {
+        connection.ensureInitialized()
+        var resolved: [String: String] = [:]
+
+        connection.dbQueue.sync { [weak self] in
+            guard let self = self else { return }
+            let sql = """
+            SELECT ua.asset_id, sac.immich_id
+            FROM uploaded_assets ua
+            JOIN hash_cache hc ON hc.asset_id = ua.asset_id
+            JOIN server_assets_cache sac ON sac.checksum = hc.sha1_hash
+            WHERE ua.immich_id = 'unknown';
+            """
+            var statement: OpaquePointer?
+            if sqlite3_prepare_v2(self.connection.db, sql, -1, &statement, nil) == SQLITE_OK {
+                while sqlite3_step(statement) == SQLITE_ROW {
+                    if let assetPtr = sqlite3_column_text(statement, 0),
+                       let immichPtr = sqlite3_column_text(statement, 1) {
+                        resolved[String(cString: assetPtr)] = String(cString: immichPtr)
+                    }
+                }
+            }
+            sqlite3_finalize(statement)
+        }
+
+        return resolved
+    }
+
+    /// Returns asset IDs where immich_id was never resolved (recorded as 'unknown').
+    func getUnknownImmichIdAssetIds() -> [String] {
+        connection.ensureInitialized()
+        var assetIds: [String] = []
+
+        connection.dbQueue.sync { [weak self] in
+            guard let self = self else { return }
+            let sql = """
+            SELECT DISTINCT asset_id FROM uploaded_assets
+            WHERE immich_id = 'unknown';
+            """
+            var statement: OpaquePointer?
+            if sqlite3_prepare_v2(self.connection.db, sql, -1, &statement, nil) == SQLITE_OK {
+                while sqlite3_step(statement) == SQLITE_ROW {
+                    if let ptr = sqlite3_column_text(statement, 0) {
+                        assetIds.append(String(cString: ptr))
+                    }
+                }
+            }
+            sqlite3_finalize(statement)
+        }
+
+        return assetIds
+    }
+
+    /// Updates immich_id for all rows matching the given asset_id where immich_id is 'unknown'.
+    func batchUpdateImmichIds(_ mappings: [String: String]) {
+        guard !mappings.isEmpty else { return }
+        connection.ensureInitialized()
+
+        connection.dbQueue.sync { [weak self] in
+            guard let self = self else { return }
+            self.connection.inTransaction {
+                let sql = """
+                UPDATE uploaded_assets SET immich_id = ?
+                WHERE asset_id = ? AND immich_id = 'unknown';
+                """
+                var statement: OpaquePointer?
+                guard sqlite3_prepare_v2(self.connection.db, sql, -1, &statement, nil) == SQLITE_OK else {
+                    logError("Failed to prepare statement for batch immich_id update: \(self.connection.lastErrorMessage)", category: .database)
+                    return
+                }
+                defer { sqlite3_finalize(statement) }
+
+                for (assetId, immichId) in mappings {
+                    sqlite3_bind_text(statement, 1, (immichId as NSString).utf8String, -1, nil)
+                    sqlite3_bind_text(statement, 2, (assetId as NSString).utf8String, -1, nil)
+                    if sqlite3_step(statement) != SQLITE_DONE {
+                        logError("Failed to update immich_id for asset \(assetId): \(self.connection.lastErrorMessage)", category: .database)
+                    }
+                    sqlite3_reset(statement)
+                }
+            }
+        }
     }
 }

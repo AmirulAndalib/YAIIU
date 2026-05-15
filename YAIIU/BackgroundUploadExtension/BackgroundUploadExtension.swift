@@ -1,4 +1,3 @@
-import CommonCrypto
 import CoreLocation
 import ExtensionFoundation
 import Photos
@@ -12,13 +11,6 @@ final class BackgroundUploadExtension: PHBackgroundResourceUploadExtension {
     private let database = BackgroundUploadDatabase.shared
     private let appGroupID = "group.com.fawenyo.yaiiu"
 
-    private lazy var urlSession: URLSession = {
-        let config = URLSessionConfiguration.default
-        config.timeoutIntervalForRequest = 30
-        config.timeoutIntervalForResource = 60
-        return URLSession(configuration: config)
-    }()
-
     private var isCancelled: Bool {
         cancelledState.withLock { $0 }
     }
@@ -30,6 +22,7 @@ final class BackgroundUploadExtension: PHBackgroundResourceUploadExtension {
     // MARK: - PHBackgroundResourceUploadExtension
 
     func process() -> PHBackgroundResourceUploadProcessingResult {
+        cancelledState.withLock { $0 = false } // Reset cancellation state at the start of processing
         log("Processing background upload jobs...")
         guard !isCancelled else { return .processing }
         guard settings.isLoggedIn, settings.backgroundUploadEnabled else {
@@ -113,9 +106,11 @@ final class BackgroundUploadExtension: PHBackgroundResourceUploadExtension {
                 resolvedFilename = resource.resolvedFilename()
             }
 
+            let resourceType = resourceTypeString(for: resource)
+
             database.recordUploadedAsset(
                 assetId: resource.assetLocalIdentifier,
-                resourceType: resourceTypeString(for: resource),
+                resourceType: resourceType,
                 filename: resolvedFilename,
                 immichId: "unknown",
                 fileSize: 0,
@@ -123,7 +118,8 @@ final class BackgroundUploadExtension: PHBackgroundResourceUploadExtension {
             )
 
             try library.performChangesAndWait {
-                PHAssetResourceUploadJobChangeRequest(for: job)?.acknowledge()
+                guard let request = PHAssetResourceUploadJobChangeRequest(for: job) else { return }
+                request.acknowledge()
             }
         }
     }
@@ -166,154 +162,56 @@ final class BackgroundUploadExtension: PHBackgroundResourceUploadExtension {
     // MARK: - Resource Discovery
 
     private func fetchPendingResources() -> [PHAssetResource] {
-        let uploaded = database.getAllUploadedAssetIds()
-        let synced = database.getAllAssetsOnServer()
-        let hashConfirmed = database.getAssetsConfirmedOnServer()
-        let skip = uploaded.union(synced).union(hashConfirmed)
+        let skip = database.getAllAssetsOnServer()
+        let inflightKeys = database.getInflightJobKeys()
 
         let opts = PHFetchOptions()
         opts.sortDescriptors = [
             NSSortDescriptor(key: "creationDate", ascending: false)
         ]
-        
+
         let allAssets = PHAsset.fetchAssets(with: .image, options: opts)
         let allVideos = PHAsset.fetchAssets(with: .video, options: opts)
 
         var pending = [PHAssetResource]()
-        var candidates = [PHAsset]()
-        let batchSize = 100
-        let maxPending = 50
 
-        // Process photos
+        let collect: (PHAsset) -> Void = { asset in
+            let resources = PHAssetResource.assetResources(for: asset)
+            for r in resources where self.shouldUpload(r) {
+                let type = self.resourceTypeString(for: r)
+                let key = "\(asset.localIdentifier)||\(type)"
+                if inflightKeys.contains(key) { continue }
+                if !self.database.isResourceUploaded(
+                    assetId: asset.localIdentifier,
+                    resourceType: type
+                ) {
+                    pending.append(r)
+                }
+            }
+        }
+
         allAssets.enumerateObjects { asset, _, stop in
             if self.isCancelled {
                 stop.pointee = true
                 return
             }
             guard !skip.contains(asset.localIdentifier) else { return }
-
-            candidates.append(asset)
-
-            if candidates.count >= batchSize {
-                pending.append(contentsOf: self.filterCandidates(candidates))
-                candidates.removeAll()
-                if pending.count >= maxPending { stop.pointee = true }
-            }
+            collect(asset)
         }
 
-        // Process videos if we haven't reached the limit
-        if pending.count < maxPending {
-            allVideos.enumerateObjects { asset, _, stop in
-                if self.isCancelled {
-                    stop.pointee = true
-                    return
-                }
-                guard !skip.contains(asset.localIdentifier) else { return }
-
-                candidates.append(asset)
-
-                if candidates.count >= batchSize {
-                    pending.append(contentsOf: self.filterCandidates(candidates))
-                    candidates.removeAll()
-                    if pending.count >= maxPending { stop.pointee = true }
-                }
+        allVideos.enumerateObjects { asset, _, stop in
+            if self.isCancelled {
+                stop.pointee = true
+                return
             }
+            guard !skip.contains(asset.localIdentifier) else { return }
+            collect(asset)
         }
 
-        // Process remaining candidates
-        if !candidates.isEmpty && pending.count < maxPending {
-            pending.append(contentsOf: filterCandidates(candidates))
-        }
-
-        return Array(pending.prefix(maxPending))
-    }
-
-    private func filterCandidates(_ candidates: [PHAsset]) -> [PHAssetResource]
-    {
-        var result = [PHAssetResource]()
-
-        for asset in candidates where !isCancelled {
-            let resources = PHAssetResource.assetResources(for: asset)
-            guard let primary = selectPrimaryResource(from: resources) else {
-                continue
-            }
-
-            if isAssetOnServer(asset: asset, resource: primary) { continue }
-
-            for r in resources where shouldUpload(r) {
-                let type = resourceTypeString(for: r)
-                if !database.isResourceUploaded(
-                    assetId: asset.localIdentifier,
-                    resourceType: type
-                ) {
-                    result.append(r)
-                }
-            }
-
-            if result.count >= 50 { break }
-        }
-
-        return result
-    }
-
-    private func isAssetOnServer(asset: PHAsset, resource: PHAssetResource)
-        -> Bool
-    {
-        let id = asset.localIdentifier
-
-        if let cached = database.getHashForAsset(assetId: id) {
-            if checkServerForChecksum(cached) {
-                database.recordHashChecked(assetId: id, sha1Hash: cached, isOnServer: true)
-                return true
-            }
-            return false
-        }
-
-        guard let hash = computeSHA1(for: resource) else { return false }
-        database.saveAssetHash(assetId: id, sha1Hash: hash)
-
-        let exists = checkServerForChecksum(hash)
-        database.recordHashChecked(assetId: id, sha1Hash: hash, isOnServer: exists)
-        return exists
+        return pending
     }
 
     // MARK: - Server Communication
-
-    private func checkServerForChecksum(_ checksum: String) -> Bool {
-        guard !settings.serverURL.isEmpty, !settings.apiKey.isEmpty,
-            let url = URL(string: "\(settings.serverURL)/api/search/metadata")
-        else {
-            return false
-        }
-
-        var req = URLRequest(url: url)
-        req.httpMethod = "POST"
-        req.setValue("application/json", forHTTPHeaderField: "Accept")
-        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.setValue(settings.apiKey, forHTTPHeaderField: "x-api-key")
-        req.timeoutInterval = 15
-        req.httpBody = try? JSONSerialization.data(withJSONObject: [
-            "checksum": checksum
-        ])
-
-        var found = false
-        let sema = DispatchSemaphore(value: 0)
-
-        urlSession.dataTask(with: req) { data, resp, _ in
-            defer { sema.signal() }
-            guard let http = resp as? HTTPURLResponse, http.statusCode == 200,
-                let data = data,
-                let json = try? JSONSerialization.jsonObject(with: data)
-                    as? [String: Any],
-                let assets = json["assets"] as? [String: Any],
-                let items = assets["items"] as? [[String: Any]]
-            else { return }
-            found = !items.isEmpty
-        }.resume()
-
-        _ = sema.wait(timeout: .now() + 15)
-        return found
-    }
 
     private func buildDestination(for resource: PHAssetResource) -> URLRequest?
     {
@@ -378,52 +276,7 @@ final class BackgroundUploadExtension: PHBackgroundResourceUploadExtension {
         return req
     }
 
-    // MARK: - Hash Computation
-
-    private func computeSHA1(for resource: PHAssetResource) -> String? {
-        var ctx = CC_SHA1_CTX()
-        CC_SHA1_Init(&ctx)
-
-        let opts = PHAssetResourceRequestOptions()
-        opts.isNetworkAccessAllowed = false
-
-        var result: String?
-        let sema = DispatchSemaphore(value: 0)
-
-        PHAssetResourceManager.default().requestData(
-            for: resource,
-            options: opts
-        ) { chunk in
-            chunk.withUnsafeBytes { buf in
-                _ = CC_SHA1_Update(&ctx, buf.baseAddress, CC_LONG(chunk.count))
-            }
-        } completionHandler: { error in
-            if error == nil {
-                var digest = [UInt8](
-                    repeating: 0,
-                    count: Int(CC_SHA1_DIGEST_LENGTH)
-                )
-                CC_SHA1_Final(&digest, &ctx)
-                result = digest.map { String(format: "%02x", $0) }.joined()
-            }
-            sema.signal()
-        }
-
-        guard sema.wait(timeout: .now() + 60) == .success else { return nil }
-        return result
-    }
-
     // MARK: - Resource Helpers
-
-    private func selectPrimaryResource(from resources: [PHAssetResource])
-        -> PHAssetResource?
-    {
-        resources.first {
-            $0.type == .fullSizePhoto || $0.type == .fullSizeVideo
-        }
-            ?? resources.first { $0.type == .photo || $0.type == .video }
-            ?? resources.first
-    }
 
     private func shouldUpload(_ resource: PHAssetResource) -> Bool {
         switch resource.type {

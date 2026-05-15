@@ -278,16 +278,17 @@ final class HashCacheRepository {
                         let rawOnServer = sqlite3_column_int(statement, 4) == 1
                         
                         let uploadedTypes = uploadedResourceTypes[identifier] ?? []
-                        let hasUploadedPrimary = !uploadedTypes.isEmpty && uploadedTypes.contains(where: { $0 != "raw" })
+                        let hasUploadedNonRAW = !uploadedTypes.isEmpty && uploadedTypes.contains(where: { $0 != "raw" })
                         let hasUploadedRAW = uploadedTypes.contains("raw")
                         
                         var isFullyUploaded = false
                         
                         if hasRAW {
-                            let primaryComplete = hasUploadedPrimary || primaryOnServer
+                            let primaryComplete = hasUploadedNonRAW || primaryOnServer
                             let rawComplete = hasUploadedRAW || rawOnServer
                             isFullyUploaded = primaryComplete && rawComplete
                         } else {
+                            let hasUploadedPrimary = hasUploadedNonRAW || hasUploadedRAW
                             isFullyUploaded = hasUploadedPrimary || primaryOnServer
                         }
                         
@@ -410,7 +411,7 @@ final class HashCacheRepository {
             let sql = """
                 SELECT asset_id, sha1_hash, raw_hash, has_raw, is_on_server, raw_on_server
                 FROM hash_cache
-                WHERE checked_at IS NULL;
+                WHERE is_on_server = 0 OR (has_raw = 1 AND raw_on_server = 0);
             """
             var statement: OpaquePointer?
             var records: [MultiResourceHashRecord] = []

@@ -60,14 +60,6 @@ final class DatabaseManager {
         uploadRepo.getUploadedCountAsync(completion: completion)
     }
     
-    func getAllUploadedAssetIds() -> Set<String> {
-        uploadRepo.getAllUploadedAssetIds()
-    }
-    
-    func getAllUploadedAssetIdsAsync(completion: @escaping (Set<String>) -> Void) {
-        uploadRepo.getAllUploadedAssetIdsAsync(completion: completion)
-    }
-    
     func getUploadedResourceCount() -> Int {
         uploadRepo.getUploadedResourceCount()
     }
@@ -273,5 +265,18 @@ final class DatabaseManager {
     
     func getImmichId(for localIdentifier: String) -> String? {
         favoriteRepo.getImmichId(for: localIdentifier)
+    }
+
+    // MARK: - Backfill
+
+    /// Resolves 'unknown' immich_id values in uploaded_assets by joining hash_cache and server_assets_cache.
+    /// Should be called after a server sync completes so server_assets_cache is up to date.
+    @discardableResult
+    func backfillImmichIdsFromServerCache() -> Int {
+        let resolved = uploadRepo.getResolvedImmichIdsFromServerCache()
+        guard !resolved.isEmpty else { return 0 }
+        uploadRepo.batchUpdateImmichIds(resolved)
+        logInfo("Backfilled immich_id for \(resolved.count) background-uploaded assets", category: .database)
+        return resolved.count
     }
 }
