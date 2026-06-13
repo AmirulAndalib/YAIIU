@@ -155,6 +155,10 @@ enum L10n {
         static var internalServerURLPlaceholder: String { "login.internalServerURL.placeholder".localized }
         static var internalServerURLHint: String { "login.internalServerURL.hint".localized }
         static var advancedSettings: String { "login.advancedSettings".localized }
+        static var email: String { "login.email".localized }
+        static var emailPlaceholder: String { "login.email.placeholder".localized }
+        static var password: String { "login.password".localized }
+        static var passwordPlaceholder: String { "login.password.placeholder".localized }
         static var apiKey: String { "login.apiKey".localized }
         static var apiKeyPlaceholder: String { "login.apiKey.placeholder".localized }
         static var button: String { "login.button".localized }
@@ -169,6 +173,9 @@ enum L10n {
         static var backgroundUploadNoteMessage: String { "login.backgroundUploadNote.message".localized }
         static var backgroundUploadNoteLearnMore: String { "login.backgroundUploadNote.learnMore".localized }
         static var backgroundUploadNoteLink: String { "login.backgroundUploadNote.link".localized }
+        static var reLoginNoticeTitle: String { "login.reLoginNotice.title".localized }
+        static var reLoginNoticeMessage: String { "login.reLoginNotice.message".localized }
+        static var reLoginConfirm: String { "login.reLoginNotice.confirm".localized }
     }
     
     // MARK: - Settings

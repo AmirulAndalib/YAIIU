@@ -17,6 +17,10 @@
 "login.internalServerURL.placeholder" = "z.B.: http://192.168.1.100:2283";
 "login.internalServerURL.hint" = "Optional. Wird verwendet, wenn Sie mit Ihrem lokalen Netzwerk verbunden sind, für schnellere Uploads.";
 "login.advancedSettings" = "Erweiterte Einstellungen";
+"login.email" = "E-Mail";
+"login.email.placeholder" = "E-Mail-Adresse eingeben";
+"login.password" = "Passwort";
+"login.password.placeholder" = "Passwort eingeben";
 "login.apiKey" = "API-Schlüssel";
 "login.apiKey.placeholder" = "Geben Sie Ihren API-Schlüssel ein";
 "login.button" = "Anmelden";
@@ -29,7 +33,9 @@
 "login.backgroundUploadNote.message" = "Wenn Sie iOS 26.1 oder höher verwenden und die Hintergrund-Upload-Funktion nutzen möchten, müssen Sie immich-proxy separat bereitstellen.";
 "login.backgroundUploadNote.learnMore" = "Mehr erfahren";
 "login.backgroundUploadNote.link" = "https://github.com/FawenYo/YAIIU/blob/main/immich-proxy/README.md";
-
+"login.reLoginNotice.title" = "Erneute Anmeldung erforderlich";
+"login.reLoginNotice.message" = "YAIIU 0.1.4 hat von API-Schlüssel auf E-Mail/Passwort-Anmeldung umgestellt. Bitte melden Sie sich erneut mit Ihren Immich-Zugangsdaten an.";
+"login.reLoginNotice.confirm" = "Jetzt neu anmelden";
 // MARK: - Settings View
 "settings.title" = "Einstellungen";
 "settings.serverInfo" = "Server-Informationen";

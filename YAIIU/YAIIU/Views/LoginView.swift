@@ -28,42 +28,45 @@ extension View {
 
 struct LoginView: View {
     @EnvironmentObject var settingsManager: SettingsManager
-    
+    @EnvironmentObject var migrationManager: MigrationManager
+
     @State private var serverURL: String = ""
     @State private var internalServerURL: String = ""
     @State private var wifiSSID: String = ""
-    @State private var apiKey: String = ""
+    @State private var email: String = ""
+    @State private var password: String = ""
     @State private var isLoading: Bool = false
     @State private var showError: Bool = false
     @State private var errorMessage: String = ""
     @State private var showAdvancedSettings: Bool = false
     @State private var currentSSID: String?
-    
+
     // Use FocusState for better keyboard management and visual feedback
     @FocusState private var focusedField: Field?
-    
+
     enum Field: Hashable {
         case serverURL
         case internalServerURL
         case wifiSSID
-        case apiKey
+        case email
+        case password
     }
-    
+
     // Cache trimmed values to avoid repeated computation during rendering
     private var trimmedServerURL: String {
         serverURL.trimmingCharacters(in: .whitespacesAndNewlines)
     }
-    
+
     private var trimmedInternalServerURL: String {
         internalServerURL.trimmingCharacters(in: .whitespacesAndNewlines)
     }
-    
-    private var trimmedApiKey: String {
-        apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+
+    private var trimmedEmail: String {
+        email.trimmingCharacters(in: .whitespacesAndNewlines)
     }
-    
+
     private var isValidInput: Bool {
-        !trimmedServerURL.isEmpty && !trimmedApiKey.isEmpty
+        !trimmedServerURL.isEmpty && !trimmedEmail.isEmpty && !password.isEmpty
     }
     
     var body: some View {
@@ -75,6 +78,11 @@ struct LoginView: View {
                     
                     // Input Fields
                     inputFieldsSection
+
+                    // Re-login notice banner (shown after v0.1.4 migration)
+                    if migrationManager.requiresReLogin {
+                        reLoginNoticeSection
+                    }
                     
                     // Login Button
                     loginButtonSection
@@ -165,7 +173,7 @@ struct LoginView: View {
                         if showAdvancedSettings {
                             focusedField = .internalServerURL
                         } else {
-                            focusedField = .apiKey
+                            focusedField = .email
                         }
                     }
                     .enhancedTextFieldStyle(isFocused: focusedField == .serverURL)
@@ -173,30 +181,54 @@ struct LoginView: View {
             
             // Advanced Settings Toggle
             advancedSettingsSection
-            
-            // API Key Field
+
+            // Email Field
             VStack(alignment: .leading, spacing: 10) {
                 Label {
-                    Text(L10n.Login.apiKey)
+                    Text(L10n.Login.email)
                         .font(.subheadline)
                         .fontWeight(.semibold)
                 } icon: {
-                    Image(systemName: "key.fill")
+                    Image(systemName: "envelope.fill")
                         .font(.subheadline)
                 }
                 .foregroundColor(.primary)
-                
-                SecureField(L10n.Login.apiKeyPlaceholder, text: $apiKey)
+
+                TextField(L10n.Login.emailPlaceholder, text: $email)
                     .textInputAutocapitalization(.never)
                     .autocorrectionDisabled()
-                    .focused($focusedField, equals: .apiKey)
+                    .keyboardType(.emailAddress)
+                    .focused($focusedField, equals: .email)
+                    .submitLabel(.next)
+                    .onSubmit {
+                        focusedField = .password
+                    }
+                    .enhancedTextFieldStyle(isFocused: focusedField == .email)
+            }
+
+            // Password Field
+            VStack(alignment: .leading, spacing: 10) {
+                Label {
+                    Text(L10n.Login.password)
+                        .font(.subheadline)
+                        .fontWeight(.semibold)
+                } icon: {
+                    Image(systemName: "lock.fill")
+                        .font(.subheadline)
+                }
+                .foregroundColor(.primary)
+
+                SecureField(L10n.Login.passwordPlaceholder, text: $password)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .focused($focusedField, equals: .password)
                     .submitLabel(.go)
                     .onSubmit {
                         if isValidInput {
                             login()
                         }
                     }
-                    .enhancedTextFieldStyle(isFocused: focusedField == .apiKey)
+                    .enhancedTextFieldStyle(isFocused: focusedField == .password)
             }
         }
     }
@@ -272,7 +304,7 @@ struct LoginView: View {
                             .focused($focusedField, equals: .wifiSSID)
                             .submitLabel(.next)
                             .onSubmit {
-                                focusedField = .apiKey
+                                focusedField = .email
                             }
                             .enhancedTextFieldStyle(isFocused: focusedField == .wifiSSID)
                         
@@ -364,6 +396,36 @@ struct LoginView: View {
         .padding(.top, 8)
     }
     
+    // MARK: - Re-Login Notice Section
+    private var reLoginNoticeSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                Image(systemName: "info.circle.fill")
+                    .font(.subheadline)
+                    .foregroundColor(.blue)
+                Text(L10n.Login.reLoginNoticeTitle)
+                    .font(.subheadline)
+                    .fontWeight(.semibold)
+                    .foregroundColor(.blue)
+            }
+
+            Text(L10n.Login.reLoginNoticeMessage)
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 12)
+                .fill(Color.blue.opacity(0.08))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(Color.blue.opacity(0.25), lineWidth: 1)
+        )
+    }
+
     // MARK: - Background Upload Note Section
     private var backgroundUploadNoteSection: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -407,28 +469,29 @@ struct LoginView: View {
     private var trimmedWifiSSID: String {
         wifiSSID.trimmingCharacters(in: .whitespacesAndNewlines)
     }
-    
+
     // MARK: - Login Action
     private func login() {
         isLoading = true
-        
+
         let formattedURL = formatURL(trimmedServerURL)
         let formattedInternalURL = trimmedInternalServerURL.isEmpty ? nil : formatURL(trimmedInternalServerURL)
         let ssidToUse = trimmedWifiSSID.isEmpty ? nil : trimmedWifiSSID
-        let apiKeyToUse = trimmedApiKey
-        
+        let emailToUse = trimmedEmail
+
         Task {
             do {
-                _ = try await ImmichAPIService.shared.getCurrentUser(
-                    serverURL: formattedURL,
-                    apiKey: apiKeyToUse
+                let accessToken = try await ImmichAPIService.shared.login(
+                    email: emailToUse,
+                    password: password,
+                    serverURL: formattedURL
                 )
-                
+
                 await MainActor.run {
                     isLoading = false
                     settingsManager.login(
                         serverURL: formattedURL,
-                        apiKey: apiKeyToUse,
+                        apiKey: accessToken,
                         internalServerURL: formattedInternalURL,
                         ssid: ssidToUse
                     )

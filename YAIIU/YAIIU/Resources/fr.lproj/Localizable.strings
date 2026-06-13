@@ -17,6 +17,10 @@
 "login.internalServerURL.placeholder" = "Ex. : http://192.168.1.100:2283";
 "login.internalServerURL.hint" = "Optionnel. Utilisé lorsque vous êtes connecté à votre réseau local pour des téléversements plus rapides.";
 "login.advancedSettings" = "Réglages avancés";
+"login.email" = "E-mail";
+"login.email.placeholder" = "Entrez votre e-mail";
+"login.password" = "Mot de passe";
+"login.password.placeholder" = "Entrez votre mot de passe";
 "login.apiKey" = "Clé API";
 "login.apiKey.placeholder" = "Entrez votre clé API";
 "login.button" = "Connexion";
@@ -29,7 +33,9 @@
 "login.backgroundUploadNote.message" = "Si vous utilisez iOS 26.1 ou version ultérieure et souhaitez utiliser la fonction de téléversement en arrière-plan, vous devez déployer immich-proxy séparément.";
 "login.backgroundUploadNote.learnMore" = "En savoir plus";
 "login.backgroundUploadNote.link" = "https://github.com/FawenYo/YAIIU/blob/main/immich-proxy/README.md";
-
+"login.reLoginNotice.title" = "Reconnexion requise";
+"login.reLoginNotice.message" = "YAIIU 0.1.4 a remplacé la clé API par une connexion email/mot de passe. Veuillez vous reconnecter avec vos identifiants Immich.";
+"login.reLoginNotice.confirm" = "Se reconnecter";
 // MARK: - Settings View
 "settings.title" = "Réglages";
 "settings.serverInfo" = "Informations du serveur";

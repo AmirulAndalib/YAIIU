@@ -17,6 +17,10 @@
 "login.internalServerURL.placeholder" = "Ej.: http://192.168.1.100:2283";
 "login.internalServerURL.hint" = "Opcional. Se usa cuando estás conectado a tu red local para subidas más rápidas.";
 "login.advancedSettings" = "Ajustes avanzados";
+"login.email" = "Correo electrónico";
+"login.email.placeholder" = "Introduce tu correo electrónico";
+"login.password" = "Contraseña";
+"login.password.placeholder" = "Introduce tu contraseña";
 "login.apiKey" = "Clave API";
 "login.apiKey.placeholder" = "Introduce tu clave API";
 "login.button" = "Iniciar sesión";
@@ -29,7 +33,9 @@
 "login.backgroundUploadNote.message" = "Si usas iOS 26.1 o posterior y quieres usar la función de subida en segundo plano, necesitas desplegar immich-proxy por separado.";
 "login.backgroundUploadNote.learnMore" = "Más información";
 "login.backgroundUploadNote.link" = "https://github.com/FawenYo/YAIIU/blob/main/immich-proxy/README.md";
-
+"login.reLoginNotice.title" = "Inicio de sesión requerido";
+"login.reLoginNotice.message" = "YAIIU 0.1.4 cambió de clave API a inicio de sesión con correo/contraseña. Por favor, inicia sesión nuevamente con tus credenciales de Immich.";
+"login.reLoginNotice.confirm" = "Iniciar sesión ahora";
 // MARK: - Settings View
 "settings.title" = "Ajustes";
 "settings.serverInfo" = "Información del servidor";

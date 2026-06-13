@@ -17,6 +17,10 @@
 "login.internalServerURL.placeholder" = "例如: http://192.168.1.100:2283";
 "login.internalServerURL.hint" = "可选。连接到本地网络时将使用此 URL 以加快上传速度。";
 "login.advancedSettings" = "高级设置";
+"login.email" = "电子邮件";
+"login.email.placeholder" = "请输入电子邮件";
+"login.password" = "密码";
+"login.password.placeholder" = "请输入密码";
 "login.apiKey" = "API Key";
 "login.apiKey.placeholder" = "输入您的 API Key";
 "login.button" = "登录";
@@ -29,7 +33,9 @@
 "login.backgroundUploadNote.message" = "如果您使用 iOS 26.1 或更新版本，且想要使用后台上传功能，需要另外部署 immich-proxy。";
 "login.backgroundUploadNote.learnMore" = "了解更多";
 "login.backgroundUploadNote.link" = "https://github.com/FawenYo/YAIIU/blob/main/immich-proxy/README.md";
-
+"login.reLoginNotice.title" = "需要重新登录";
+"login.reLoginNotice.message" = "YAIIU 0.1.4 已从 API Key 改为账号密码登录。请使用您的 Immich 账号重新登录。";
+"login.reLoginNotice.confirm" = "立即重新登录";
 // MARK: - Settings View
 "settings.title" = "设置";
 "settings.serverInfo" = "服务器信息";
