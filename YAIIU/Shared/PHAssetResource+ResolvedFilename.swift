@@ -39,20 +39,28 @@ extension PHAssetResource {
         _ filename: String, asset: PHAsset
     ) -> String {
         let resources = PHAssetResource.assetResources(for: asset)
-        guard let originalResource = resources.first(where: {
+        let editedExtension = (filename as NSString).pathExtension
+
+        // Prefer the photo companion resource (edited stills, Live Photos), then
+        // fall back to the .video resource for pure video assets (e.g. Apple Log
+        // HDR exported by third-party camera apps) to recover the captured filename.
+        let originalResource = resources.first(where: {
             ($0.type == .photo || $0.type == .fullSizePhoto)
                 && !$0.originalFilename.hasPrefix("FullSizeRender")
-        }) else {
+        }) ?? resources.first(where: {
+            $0.type == .video
+                && !$0.originalFilename.hasPrefix("FullSizeRender")
+        })
+
+        guard let originalResource else {
             return filename
         }
-
-        let originalName =
-            (originalResource.originalFilename as NSString).deletingPathExtension
-        let editedExtension = (filename as NSString).pathExtension
 
         if editedExtension.isEmpty {
             return originalResource.originalFilename
         }
+        let originalName =
+            (originalResource.originalFilename as NSString).deletingPathExtension
         return "\(originalName).\(editedExtension)"
     }
 }

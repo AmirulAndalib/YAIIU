@@ -111,6 +111,27 @@ func BackgroundUploadHandler(immichServerURL string) http.HandlerFunc {
 
 		log.Printf("[%s] Received %d bytes of photo data", clientIP, len(photoData))
 
+		// Last-resort safety net: if headers are missing or wrong, use magic byte
+		// detection to prevent video payloads from reaching Immich as image/jpeg.
+		if len(photoData) > 0 &&
+			(metadata.Filename == "upload.jpg" || metadata.ContentType == "application/octet-stream") {
+			detected := http.DetectContentType(photoData)
+			if strings.HasPrefix(detected, "video/") {
+				if metadata.Filename == "upload.jpg" {
+					switch detected {
+					case "video/mp4":
+						metadata.Filename = "upload.mp4"
+					default:
+						// .mov is a reasonable default for Apple ecosystem videos
+						metadata.Filename = "upload.mov"
+					}
+				}
+				metadata.ContentType = detected
+				log.Printf("[%s] Magic byte detection overrode metadata: filename=%s contentType=%s",
+					clientIP, metadata.Filename, metadata.ContentType)
+			}
+		}
+
 		// Create multipart form data for Immich
 		body, contentType, err := createMultipartRequest(metadata, photoData)
 		if err != nil {
