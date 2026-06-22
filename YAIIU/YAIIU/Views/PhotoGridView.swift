@@ -272,8 +272,9 @@ struct PhotoGridView: View {
     
     @State private var filteredIndices: [Int] = []
     @State private var cachedNotUploadedCount: Int = 0
-    @State private var isFilteringInProgress = false
-    @State private var filterCacheVersion: Int = 0
+    @State private var countRefreshTask: Task<Void, Never>?
+    @State private var recomputeTask: Task<Void, Never>?
+    @State private var countComputeVersion: Int = 0
     @State private var isSelectingAll = false
     @State private var selectionTask: Task<Void, Never>?
     
@@ -401,6 +402,12 @@ struct PhotoGridView: View {
             selectionTask?.cancel()
             selectionTask = nil
             isSelectingAll = false
+            countRefreshTask?.cancel()
+            countRefreshTask = nil
+            recomputeTask?.cancel()
+            recomputeTask = nil
+            processingTask?.cancel()
+            processingTask = nil
         }
         .onChange(of: photoLibraryManager.assetCount) { oldValue, newValue in
             if newValue > 0 && oldValue == 0 {
@@ -415,10 +422,7 @@ struct PhotoGridView: View {
                     
                     await MainActor.run {
                         guard !Task.isCancelled, !photoLibraryManager.isLoading else { return }
-                        updateNotUploadedCount()
-                        if currentFilter == .notUploaded {
-                            refreshFilterCache()
-                        }
+                        recomputeCounts()
                     }
                 }
             }
@@ -428,23 +432,40 @@ struct PhotoGridView: View {
                 Task {
                     try? await Task.sleep(nanoseconds: 500_000_000)
                     await MainActor.run {
+                        // refreshStatusCache() republishes syncStatusCache, which
+                        // the .onReceive listener already turns into a debounced
+                        // recomputeCounts(), so no direct call is needed here.
                         hashManager.refreshStatusCache()
-                        updateNotUploadedCount()
-                        if currentFilter == .notUploaded {
-                            refreshFilterCache()
-                        }
                     }
                 }
             }
         }
         .onChange(of: hashManager.isProcessing) { oldValue, newValue in
             if oldValue == true && newValue == false {
-                updateNotUploadedCount()
-                if currentFilter == .notUploaded {
-                    refreshFilterCache()
-                }
                 syncPendingICloudIds()
             }
+        }
+        // The count must track the same source as the per-photo icons
+        // (syncStatusCache). finishProcessing() flips isProcessing before the
+        // authoritative DB reload lands, so reacting to the cache itself ensures
+        // the count converges to the final state instead of a mid-flight snapshot.
+        // During hashing the cache mutates per asset, so coalesce the bursts into
+        // a single recompute after activity settles to avoid main-thread churn.
+        // Use the same publisher the per-photo icons subscribe to (onReceive),
+        // not onChange(of:). onChange only fires when SwiftUI's diff sees a new
+        // value during body re-eval, which can be skipped; onReceive fires on
+        // every publish, so the count tracks the icons exactly.
+        .onReceive(hashManager.$syncStatusCache.receive(on: RunLoop.main)) { _ in
+            scheduleCountRefresh()
+        }
+    }
+
+    private func scheduleCountRefresh() {
+        countRefreshTask?.cancel()
+        countRefreshTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            guard !Task.isCancelled else { return }
+            recomputeCounts()
         }
     }
     
@@ -516,17 +537,7 @@ struct PhotoGridView: View {
                     filterIndicatorView
                 }
                 
-                ZStack {
-                    simpleGridView
-                    
-                    if isFilteringInProgress && currentFilter != .all {
-                        Color.black.opacity(0.3)
-                            .ignoresSafeArea()
-                        ProgressView()
-                            .scaleEffect(1.5)
-                            .tint(.white)
-                    }
-                }
+                simpleGridView
             }
             .frame(width: geometry.size.width, height: geometry.size.height)
             .onAppear { gridContainerWidth = geometry.size.width }
@@ -674,14 +685,9 @@ struct PhotoGridView: View {
         HStack {
             Image(systemName: currentFilter.iconName)
                 .foregroundColor(.orange)
-            if isFilteringInProgress {
-                ProgressView()
-                    .scaleEffect(0.7)
-            } else {
-                Text(L10n.PhotoGrid.filterActive(displayCount))
-                    .font(.subheadline)
-                    .foregroundColor(.secondary)
-            }
+            Text(L10n.PhotoGrid.filterActive(displayCount))
+                .font(.subheadline)
+                .foregroundColor(.secondary)
             Spacer()
             Button {
                 applyFilter(.all)
@@ -733,54 +739,17 @@ struct PhotoGridView: View {
         currentFilter = filter
         
         if filter == .notUploaded {
-            refreshFilterCache()
+            // filteredIndices is kept current by recomputeCounts(); rebuild it
+            // off the main thread so tapping the filter never blocks the UI on
+            // large libraries. recomputeCounts() flips refreshToken once the new
+            // indices land, so avoid rebuilding here with the stale set first.
+            recomputeCounts()
         } else {
-            // Force grid rebuild when switching back to "all"
+            // Other filters use the full set immediately, so rebuild now.
             refreshToken = UUID()
         }
     }
-    
-    private func refreshFilterCache() {
-        guard !isFilteringInProgress else { return }
-        
-        isFilteringInProgress = true
-        filterCacheVersion += 1
-        let currentVersion = filterCacheVersion
-        
-        let manager = photoLibraryManager
-        let hash = hashManager
-        
-        // Capture statusCache inside the Task to get the latest snapshot
-        Task.detached(priority: .userInitiated) {
-            // Read latest values atomically to ensure consistency
-            let (statusCache, totalCount, fetchResult) = await MainActor.run {
-                (hash.syncStatusCache, manager.assetCount, manager.fetchResult)
-            }
-            
-            var indices: [Int] = []
-            indices.reserveCapacity(totalCount / 4)
-            
-            if let fetchResult = fetchResult {
-                fetchResult.enumerateObjects { (asset, index, _) in
-                    let status = statusCache[asset.localIdentifier] ?? .pending
-                    if status != .uploaded {
-                        indices.append(index)
-                    }
-                }
-            }
-            
-            await MainActor.run {
-                guard currentVersion == self.filterCacheVersion else { return }
-                
-                self.filteredIndices = indices
-                self.cachedNotUploadedCount = indices.count
-                self.isFilteringInProgress = false
-                // Force grid rebuild to display correct thumbnails
-                self.refreshToken = UUID()
-            }
-        }
-    }
-    
+
     private func syncPendingICloudIds() {
         let updates = hashManager.pendingICloudIdUpdates
         guard !updates.isEmpty else { return }
@@ -825,33 +794,45 @@ struct PhotoGridView: View {
         }
     }
 
-    private func updateNotUploadedCount() {
+    /// Single off-main pass that derives both the not-uploaded count and the
+    /// filtered index set from the current syncStatusCache. Iterates the cached
+    /// orderedLocalIdentifiers array (in-memory) rather than re-enumerating the
+    /// lazy PHFetchResult, which is orders of magnitude faster on large
+    /// libraries and lets the badge stay in sync with the per-photo icons.
+    @MainActor
+    private func recomputeCounts() {
         let manager = photoLibraryManager
         let hash = hashManager
-        
-        Task.detached(priority: .utility) {
-            // Read latest values atomically to ensure consistency
-            let (statusCache, totalCount, fetchResult) = await MainActor.run {
-                (hash.syncStatusCache, manager.assetCount, manager.fetchResult)
+
+        recomputeTask?.cancel()
+
+        countComputeVersion += 1
+        let version = countComputeVersion
+
+        recomputeTask = Task(priority: .utility) {
+            let (statusCache, identifiers) = await MainActor.run {
+                (hash.syncStatusCache, manager.orderedLocalIdentifiers)
             }
-            
-            guard let fetchResult = fetchResult else {
-                await MainActor.run {
-                    self.cachedNotUploadedCount = totalCount
+
+            var notUploadedIndices: [Int] = []
+            notUploadedIndices.reserveCapacity(identifiers.count / 4)
+            for (index, id) in identifiers.enumerated() {
+                if Task.isCancelled { return }
+                if statusCache[id] != .uploaded {
+                    notUploadedIndices.append(index)
                 }
-                return
             }
-            
-            var uploadedCount = 0
-            fetchResult.enumerateObjects { (asset, _, _) in
-                if statusCache[asset.localIdentifier] == .uploaded {
-                    uploadedCount += 1
-                }
-            }
-            
-            let notUploadedCount = totalCount - uploadedCount
+
             await MainActor.run {
-                self.cachedNotUploadedCount = notUploadedCount
+                // Discard results from superseded invocations; without this guard
+                // a task that read an earlier cache snapshot could finish last and
+                // overwrite with a stale value (stale-wins race).
+                guard !Task.isCancelled, version == self.countComputeVersion else { return }
+                self.cachedNotUploadedCount = notUploadedIndices.count
+                self.filteredIndices = notUploadedIndices
+                if self.currentFilter == .notUploaded {
+                    self.refreshToken = UUID()
+                }
             }
         }
     }
@@ -909,11 +890,8 @@ struct PhotoGridView: View {
         firstRowTopOffset = 0
         
         refreshToken = UUID()
-        
-        updateNotUploadedCount()
-        if currentFilter == .notUploaded {
-            refreshFilterCache()
-        }
+
+        recomputeCounts()
     }
     
     
