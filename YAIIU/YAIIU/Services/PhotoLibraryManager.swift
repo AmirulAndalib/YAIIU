@@ -4,7 +4,7 @@ import UIKit
 
 /// Manages photo library access with lazy loading for optimal memory performance.
 /// Uses PHFetchResult directly instead of materializing all PHAsset objects into arrays.
-final class PhotoLibraryManager: ObservableObject {
+final class PhotoLibraryManager: NSObject, ObservableObject, PHPhotoLibraryChangeObserver {
     @Published var authorizationStatus: PHAuthorizationStatus = .notDetermined
     @Published private(set) var isLoading: Bool = false
     @Published private(set) var assetCount: Int = 0
@@ -25,10 +25,72 @@ final class PhotoLibraryManager: ObservableObject {
         return _fetchResult
     }
     
-    init() {
+    override init() {
+        super.init()
         authorizationStatus = PHPhotoLibrary.authorizationStatus(for: .readWrite)
         if authorizationStatus == .authorized || authorizationStatus == .limited {
             fetchAssets()
+        }
+        PHPhotoLibrary.shared().register(self)
+    }
+
+    deinit {
+        PHPhotoLibrary.shared().unregisterChangeObserver(self)
+    }
+
+    /// Incrementally applies library changes so photos captured while the app was
+    /// backgrounded appear on foreground without a full re-fetch. Updating from the
+    /// change details avoids swapping the fetch result out from under the grid, which
+    /// would blank all thumbnails while they reload.
+    func photoLibraryDidChange(_ changeInstance: PHChange) {
+        guard let currentResult = fetchResult,
+              let changes = changeInstance.changeDetails(for: currentResult) else {
+            return
+        }
+
+        // Skip only for incremental notifications that carry no actual edits.
+        // Registering the observer (and some foreground transitions) can deliver
+        // such a change; republishing then rebuilds the grid and blanks all
+        // thumbnails. Non-incremental changes (e.g. permission or full-library
+        // updates) must still be applied, otherwise the grid goes stale.
+        if changes.hasIncrementalChanges {
+            let insertedEmpty = changes.insertedIndexes?.isEmpty ?? true
+            let removedEmpty = changes.removedIndexes?.isEmpty ?? true
+            let changedEmpty = changes.changedIndexes?.isEmpty ?? true
+            if insertedEmpty && removedEmpty && changedEmpty && !changes.hasMoves {
+                return
+            }
+        }
+
+        let updatedResult = changes.fetchResultAfterChanges
+        let count = updatedResult.count
+
+        // Phase 1: publish the fetch result and count so the grid updates promptly.
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.fetchResultLock.lock()
+            self._fetchResult = updatedResult
+            self.fetchResultLock.unlock()
+            self.assetCount = count
+        }
+
+        // Phase 2: build the full identifier list off the critical path, matching
+        // the two-phase pattern in fetchAssetsAsync.
+        Task(priority: .utility) {
+            var identifiers: [String] = []
+            identifiers.reserveCapacity(count)
+            updatedResult.enumerateObjects { asset, _, _ in
+                identifiers.append(asset.localIdentifier)
+            }
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                // Drop the result if a newer change superseded this fetch result
+                // while enumerating; otherwise a slow task could overwrite the
+                // identifiers with a stale list, desyncing them from _fetchResult.
+                if self.fetchResult === updatedResult {
+                    self.orderedLocalIdentifiers = identifiers
+                }
+            }
         }
     }
     
@@ -66,29 +128,37 @@ final class PhotoLibraryManager: ObservableObject {
     @MainActor
     func fetchAssetsAsync() async {
         isLoading = true
-        
-        let (result, count, identifiers) = await Task.detached(priority: .userInitiated) {
+
+        // Fetch the lazy PHFetchResult first. `count` is O(1), so the grid can paint
+        // immediately via lazy `asset(at:)` access. Enumerating every identifier for a
+        // large library takes several seconds and must not block the first paint.
+        let result = await Task.detached(priority: .userInitiated) {
             let fetchOptions = PHFetchOptions()
             fetchOptions.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
             fetchOptions.includeHiddenAssets = false
-
-            let result = PHAsset.fetchAssets(with: fetchOptions)
-            var identifiers: [String] = []
-            identifiers.reserveCapacity(result.count)
-            result.enumerateObjects { asset, _, _ in
-                identifiers.append(asset.localIdentifier)
-            }
-            return (result, result.count, identifiers)
+            return PHAsset.fetchAssets(with: fetchOptions)
         }.value
 
         fetchResultLock.lock()
         _fetchResult = result
         fetchResultLock.unlock()
 
-        assetCount = count
-        orderedLocalIdentifiers = identifiers
+        assetCount = result.count
         isLoading = false
-        
+
+        // Build the full identifier list off the critical path. It is only needed for
+        // the "not uploaded" filter/count, not for the default grid, so publishing it
+        // after first paint keeps launch responsive.
+        let identifiers = await Task.detached(priority: .utility) {
+            var ids: [String] = []
+            ids.reserveCapacity(result.count)
+            result.enumerateObjects { asset, _, _ in
+                ids.append(asset.localIdentifier)
+            }
+            return ids
+        }.value
+        orderedLocalIdentifiers = identifiers
+
         await triggerFavoriteSync()
     }
     
