@@ -305,7 +305,11 @@ struct PhotoGridView: View {
             return filteredIndices.count
         }
     }
-    
+
+    private var isTabBarHidden: Bool {
+        showingPhotoDetail || isSelectionMode
+    }
+
     var body: some View {
         ZStack {
             NavigationView {
@@ -346,17 +350,22 @@ struct PhotoGridView: View {
                                 isSelectionMode = true
                             }
                             .disabled(displayCount == 0)
-                        } else {
-                            HStack(spacing: 12) {
-                                Button(L10n.PhotoGrid.selectAllNotUploaded) {
-                                    selectAllNotUploaded()
-                                }
-                                .disabled(hashManager.isProcessing || isSelectingAll)
-                                Button(L10n.PhotoGrid.upload(selectedAssets.count)) {
-                                    showingUploadConfirmation = true
-                                }
-                                .disabled(selectedAssets.isEmpty)
+                        }
+                    }
+
+                    ToolbarItemGroup(placement: .bottomBar) {
+                        if isSelectionMode {
+                            Button(L10n.PhotoGrid.selectAllNotUploaded) {
+                                selectAllNotUploaded()
                             }
+                            .disabled(hashManager.isProcessing || isSelectingAll)
+
+                            Spacer()
+
+                            Button(L10n.PhotoGrid.upload(selectedAssets.count)) {
+                                showingUploadConfirmation = true
+                            }
+                            .disabled(selectedAssets.isEmpty)
                         }
                     }
                 }
@@ -370,8 +379,8 @@ struct PhotoGridView: View {
                 }
             }
             .navigationViewStyle(.stack)
-            .toolbar(showingPhotoDetail ? .hidden : .visible, for: .tabBar)
-            .animation(.easeInOut(duration: 0.2), value: showingPhotoDetail)
+            .toolbar(isTabBarHidden ? .hidden : .visible, for: .tabBar)
+            .animation(.easeInOut(duration: 0.2), value: isTabBarHidden)
             
             if showingPhotoDetail && displayCount > 0 {
                 PhotoDetailView(
