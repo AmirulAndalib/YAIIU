@@ -55,41 +55,71 @@ class BackgroundUploadManager: ObservableObject {
         
         // Enable the extension
         let library = PHPhotoLibrary.shared()
-        
-        do {
-            try library.setUploadJobExtensionEnabled(true)
-            
+
+        // setUploadJobExtensionEnabled(true) throws PHPhotosErrorDomain 3202 when the
+        // extension is already enabled. The system state can already be enabled from a
+        // previous session, so treat an already-enabled extension as success and skip
+        // the redundant call.
+        guard !library.uploadJobExtensionEnabled else {
             await MainActor.run {
                 self.isEnabled = true
                 self.sharedSettings.backgroundUploadEnabled = true
                 self.errorMessage = nil
             }
-            
+            logInfo("Background upload extension already enabled", category: .upload)
+            return
+        }
+
+        do {
+            try library.setUploadJobExtensionEnabled(true)
+
+            await MainActor.run {
+                self.isEnabled = true
+                self.sharedSettings.backgroundUploadEnabled = true
+                self.errorMessage = nil
+            }
+
             logInfo("Background upload extension enabled successfully", category: .upload)
-            
+
         } catch {
+            if let nsError = error as NSError? {
+                logError("setUploadJobExtensionEnabled failed: domain=\(nsError.domain) code=\(nsError.code) userInfo=\(nsError.userInfo)", category: .upload)
+            } else {
+                logError("setUploadJobExtensionEnabled failed: \(error.localizedDescription)", category: .upload)
+            }
             await MainActor.run {
                 self.errorMessage = error.localizedDescription
             }
-            logError("Failed to enable background upload extension: \(error.localizedDescription)", category: .upload)
             throw error
         }
     }
-    
+
     func disableBackgroundUpload() async throws {
         logInfo("Disabling background upload extension...", category: .upload)
         
         let library = PHPhotoLibrary.shared()
-        
-        do {
-            try library.setUploadJobExtensionEnabled(false)
-            
+
+        // Skip the redundant call if the extension is already disabled to avoid a
+        // symmetric state error from setUploadJobExtensionEnabled(false).
+        guard library.uploadJobExtensionEnabled else {
             await MainActor.run {
                 self.isEnabled = false
                 self.sharedSettings.backgroundUploadEnabled = false
                 self.errorMessage = nil
             }
-            
+            logInfo("Background upload extension already disabled", category: .upload)
+            return
+        }
+
+        do {
+            try library.setUploadJobExtensionEnabled(false)
+
+            await MainActor.run {
+                self.isEnabled = false
+                self.sharedSettings.backgroundUploadEnabled = false
+                self.errorMessage = nil
+            }
+
             logInfo("Background upload extension disabled successfully", category: .upload)
             
         } catch {
