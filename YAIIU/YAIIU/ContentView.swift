@@ -1,4 +1,5 @@
 import CoreLocation
+import Photos
 import SwiftUI
 
 // MARK: - URL Identifiable Extension for sheet(item:) support
@@ -79,6 +80,8 @@ struct SettingsView: View {
     @State private var backgroundUploadEnabled = false
     @State private var backgroundUploadLoading = false
     @State private var backgroundUploadError: String?
+    @State private var albumSyncError: String?
+    @State private var albumSyncAuthorizationGeneration = UUID()
     @State private var lastBackgroundUploadDate: Date?
     
     @ObservedObject private var networkReachability = NetworkReachability.shared
@@ -200,6 +203,73 @@ struct SettingsView: View {
                     }
                 }
                 
+                Section(
+                    header: Text(L10n.Settings.albumSyncSection),
+                    footer: Text(L10n.Settings.albumSyncDescription).font(.caption)
+                ) {
+                    Toggle(isOn: Binding(
+                        get: { settingsManager.syncApplePhotosAlbums },
+                        set: { enabled in
+                            let requestGeneration = UUID()
+                            albumSyncAuthorizationGeneration = requestGeneration
+                            let requestSessionGeneration = AlbumSyncService.currentSessionGeneration
+                            guard enabled else {
+                                albumSyncError = nil
+                                settingsManager.updateSyncApplePhotosAlbums(false)
+                                return
+                            }
+
+                            let status = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+                            if status == .authorized || status == .limited {
+                                albumSyncError = nil
+                                settingsManager.updateSyncApplePhotosAlbums(true)
+                                Task { await AlbumSyncService.shared.syncIfEnabled() }
+                                return
+                            }
+                            guard status == .notDetermined else {
+                                albumSyncError = status == .restricted
+                                    ? L10n.Settings.albumSyncPermissionRestricted
+                                    : L10n.Settings.albumSyncPermissionDenied
+                                return
+                            }
+
+                            albumSyncError = nil
+                            PhotoLibraryManager.shared.requestAuthorization { newStatus in
+                                guard requestGeneration == albumSyncAuthorizationGeneration,
+                                      requestSessionGeneration == AlbumSyncService.currentSessionGeneration,
+                                      settingsManager.isLoggedIn,
+                                      settingsManager.syncApplePhotosAlbums == false else { return }
+                                guard newStatus == .authorized || newStatus == .limited else {
+                                    albumSyncError = newStatus == .restricted
+                                        ? L10n.Settings.albumSyncPermissionRestricted
+                                        : L10n.Settings.albumSyncPermissionDenied
+                                    return
+                                }
+                                albumSyncError = nil
+                                settingsManager.updateSyncApplePhotosAlbums(true)
+                                Task { await AlbumSyncService.shared.syncIfEnabled() }
+                            }
+                        }
+                    )) {
+                        Label(L10n.Settings.albumSyncTitle, systemImage: "rectangle.stack.badge.plus")
+                    }
+                    if let albumSyncError {
+                        HStack {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .foregroundColor(.red)
+                            Text(albumSyncError)
+                                .font(.caption)
+                                .foregroundColor(.red)
+                        }
+                        Button(L10n.PhotoGrid.permissionOpenSettings) {
+                            if let settingsURL = URL(string: UIApplication.openSettingsURLString) {
+                                UIApplication.shared.open(settingsURL)
+                            }
+                        }
+                        .font(.caption)
+                    }
+                }
+
                 Section(header: Text(L10n.Settings.dataManagement)) {
                     Button(action: {
                         showingImportView = true
@@ -325,6 +395,17 @@ struct SettingsView: View {
                 loadHashCacheStats()
                 loadLogStats()
                 loadBackgroundUploadStatus()
+                reconcileAlbumSyncState()
+            }
+            .onReceive(NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)) { _ in
+                if #available(iOS 26.1, *) {
+                    BackgroundUploadManager.shared.checkExtensionStatus()
+                }
+                PhotoLibraryManager.shared.requestAuthorization()
+                reconcileAlbumSyncState()
+                if settingsManager.syncApplePhotosAlbums {
+                    Task { await AlbumSyncService.shared.syncIfEnabled() }
+                }
             }
             .alert(L10n.Settings.logoutConfirmTitle, isPresented: $showingLogoutAlert) {
                 Button(L10n.Settings.logoutCancel, role: .cancel) { }
@@ -447,6 +528,17 @@ struct SettingsView: View {
                     }
                 }
             }
+        }
+    }
+
+    private func reconcileAlbumSyncState() {
+        let status = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+        if status == .authorized || status == .limited {
+            albumSyncError = nil
+        } else if settingsManager.syncApplePhotosAlbums {
+            albumSyncError = status == .restricted
+                ? L10n.Settings.albumSyncPermissionRestricted
+                : L10n.Settings.albumSyncPermissionDenied
         }
     }
 }

@@ -309,6 +309,76 @@ final class UploadRecordRepository {
         }
     }
     
+    func albumAssetIds(for localIdentifiers: [String], ownerId: String) throws -> [String] {
+        guard !localIdentifiers.isEmpty else { return [] }
+        connection.ensureInitialized()
+        let chunkSize = 500
+        var allIds: [String] = []
+        for chunkStart in stride(from: 0, to: localIdentifiers.count, by: chunkSize) {
+            let chunkEnd = min(chunkStart + chunkSize, localIdentifiers.count)
+            let chunk = Array(localIdentifiers[chunkStart..<chunkEnd])
+            let chunkIds = try connection.dbQueue.sync {
+                let values = Array(repeating: "(?)", count: chunk.count).joined(separator: ",")
+                let sql = """
+                WITH requested(asset_id) AS (VALUES \(values))
+                SELECT u.immich_id
+                FROM requested r
+                JOIN uploaded_assets u ON u.asset_id = r.asset_id
+                JOIN server_assets_cache s ON s.immich_id = u.immich_id
+                WHERE u.id = (
+                    SELECT MAX(u2.id) FROM uploaded_assets u2
+                    WHERE u2.asset_id = u.asset_id
+                      AND (
+                          u2.resource_type NOT IN ('raw', 'video')
+                          OR NOT EXISTS (
+                              SELECT 1 FROM uploaded_assets u3
+                              WHERE u3.asset_id = u.asset_id
+                                AND u3.resource_type NOT IN ('raw', 'video')
+                          )
+                      )
+                ) AND s.owner_id = ?
+                UNION
+                SELECT s.immich_id
+                FROM requested r
+                JOIN hash_cache h ON h.asset_id = r.asset_id
+                JOIN server_assets_cache s ON s.checksum = h.sha1_hash
+                WHERE s.owner_id = ?;
+                """
+                var statement: OpaquePointer?
+                defer { sqlite3_finalize(statement) }
+                func databaseError() -> NSError {
+                    NSError(domain: "AlbumAssetResolver", code: Int(sqlite3_errcode(connection.db)),
+                            userInfo: [NSLocalizedDescriptionKey: connection.lastErrorMessage])
+                }
+                guard sqlite3_prepare_v2(connection.db, sql, -1, &statement, nil) == SQLITE_OK else { throw databaseError() }
+                let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+                for (index, localIdentifier) in chunk.enumerated() {
+                    _ = localIdentifier.withCString { value in
+                        sqlite3_bind_text(statement, Int32(index + 1), value, -1, transient)
+                    }
+                }
+                let ownerBindingStart = chunk.count + 1
+                _ = ownerId.withCString { value in
+                    sqlite3_bind_text(statement, Int32(ownerBindingStart), value, -1, transient)
+                    sqlite3_bind_text(statement, Int32(ownerBindingStart + 1), value, -1, transient)
+                }
+                var ids: [String] = []
+                var result = sqlite3_step(statement)
+                while result == SQLITE_ROW {
+                    if let text = sqlite3_column_text(statement, 0) {
+                        let id = String(cString: text)
+                        if UUID(uuidString: id) != nil { ids.append(id) }
+                    }
+                    result = sqlite3_step(statement)
+                }
+                guard result == SQLITE_DONE else { throw databaseError() }
+                return ids
+            }
+            allIds.append(contentsOf: chunkIds)
+        }
+        return allIds
+    }
+
     private func getAllUploadedAssetMappingsInternal() -> [(localIdentifier: String, immichId: String)] {
         let sql = """
         SELECT DISTINCT asset_id, immich_id FROM uploaded_assets
@@ -351,7 +421,15 @@ final class UploadRecordRepository {
             FROM uploaded_assets ua
             JOIN hash_cache hc ON hc.asset_id = ua.asset_id
             JOIN server_assets_cache sac ON sac.checksum = hc.sha1_hash
-            WHERE ua.immich_id = 'unknown';
+            WHERE ua.immich_id = 'unknown'
+              AND NOT (
+                  ua.resource_type IN ('raw', 'video')
+                  AND EXISTS (
+                      SELECT 1 FROM uploaded_assets ua2
+                      WHERE ua2.asset_id = ua.asset_id
+                        AND ua2.resource_type NOT IN ('raw', 'video')
+                  )
+              );
             """
             var statement: OpaquePointer?
             if sqlite3_prepare_v2(self.connection.db, sql, -1, &statement, nil) == SQLITE_OK {
@@ -395,15 +473,21 @@ final class UploadRecordRepository {
 
     /// Updates immich_id for all rows matching the given asset_id where immich_id is 'unknown'.
     func batchUpdateImmichIds(_ mappings: [String: String]) {
-        guard !mappings.isEmpty else { return }
-        connection.ensureInitialized()
 
         connection.dbQueue.sync { [weak self] in
             guard let self = self else { return }
             self.connection.inTransaction {
                 let sql = """
                 UPDATE uploaded_assets SET immich_id = ?
-                WHERE asset_id = ? AND immich_id = 'unknown';
+                WHERE asset_id = ? AND immich_id = 'unknown'
+                  AND NOT (
+                      resource_type IN ('raw', 'video')
+                      AND EXISTS (
+                          SELECT 1 FROM uploaded_assets ua2
+                          WHERE ua2.asset_id = uploaded_assets.asset_id
+                            AND ua2.resource_type NOT IN ('raw', 'video')
+                      )
+                  );
                 """
                 var statement: OpaquePointer?
                 guard sqlite3_prepare_v2(self.connection.db, sql, -1, &statement, nil) == SQLITE_OK else {

@@ -8,6 +8,7 @@ class SettingsManager: ObservableObject {
     @Published var apiKey: String = ""
     @Published var isLoggedIn: Bool = false
     @Published var allowCellularBackgroundUpload: Bool = true
+    @Published var syncApplePhotosAlbums: Bool = false
     @Published var hasCompletedOnboarding: Bool = false
     @Published var hasCompletedInitialSetup: Bool = false
     @Published var hasCompletedPhotoPermission: Bool = false
@@ -16,11 +17,12 @@ class SettingsManager: ObservableObject {
     private let internalServerURLKey = "immich_internal_server_url"
     private let internalNetworkSSIDKey = "immich_internal_network_ssid"
     private let apiKeyKey = "immich_api_key"
-    private let isLoggedInKey = "immich_is_logged_in"
+    static let isLoggedInKey = "immich_is_logged_in"
     private let hasCompletedOnboardingKey = "immich_has_completed_onboarding"
     private let hasCompletedInitialSetupKey = "immich_has_completed_initial_setup"
     private let hasCompletedPhotoPermissionKey = "immich_has_completed_photo_permission"
     private let allowCellularBackgroundUploadKey = "immich_allow_cellular_background_upload"
+    static let syncApplePhotosAlbumsKey = "immich_sync_apple_photos_albums"
     init() {
         loadSettings()
     }
@@ -30,15 +32,16 @@ class SettingsManager: ObservableObject {
         internalServerURL = UserDefaults.standard.string(forKey: internalServerURLKey) ?? ""
         internalNetworkSSID = UserDefaults.standard.string(forKey: internalNetworkSSIDKey) ?? ""
         apiKey = loadAPIKeyFromKeychain() ?? ""
-        isLoggedIn = UserDefaults.standard.bool(forKey: isLoggedInKey)
+        isLoggedIn = UserDefaults.standard.bool(forKey: Self.isLoggedInKey)
         hasCompletedOnboarding = UserDefaults.standard.bool(forKey: hasCompletedOnboardingKey)
         hasCompletedInitialSetup = UserDefaults.standard.bool(forKey: hasCompletedInitialSetupKey)
         hasCompletedPhotoPermission = UserDefaults.standard.bool(forKey: hasCompletedPhotoPermissionKey)
         allowCellularBackgroundUpload = UserDefaults.standard.object(forKey: allowCellularBackgroundUploadKey) as? Bool ?? true
+        syncApplePhotosAlbums = UserDefaults.standard.bool(forKey: Self.syncApplePhotosAlbumsKey)
 
         if isLoggedIn && (serverURL.isEmpty || apiKey.isEmpty) {
             isLoggedIn = false
-            UserDefaults.standard.set(false, forKey: isLoggedInKey)
+            UserDefaults.standard.set(false, forKey: Self.isLoggedInKey)
         }
         
         if !internalNetworkSSID.isEmpty {
@@ -50,12 +53,13 @@ class SettingsManager: ObservableObject {
         UserDefaults.standard.set(serverURL, forKey: serverURLKey)
         UserDefaults.standard.set(internalServerURL, forKey: internalServerURLKey)
         UserDefaults.standard.set(internalNetworkSSID, forKey: internalNetworkSSIDKey)
-        UserDefaults.standard.set(isLoggedIn, forKey: isLoggedInKey)
+        UserDefaults.standard.set(isLoggedIn, forKey: Self.isLoggedInKey)
         UserDefaults.standard.set(hasCompletedOnboarding, forKey: hasCompletedOnboardingKey)
         UserDefaults.standard.set(hasCompletedInitialSetup, forKey: hasCompletedInitialSetupKey)
         UserDefaults.standard.set(hasCompletedPhotoPermission, forKey: hasCompletedPhotoPermissionKey)
         saveAPIKeyToKeychain(apiKey)
         UserDefaults.standard.set(allowCellularBackgroundUpload, forKey: allowCellularBackgroundUploadKey)
+        UserDefaults.standard.set(syncApplePhotosAlbums, forKey: Self.syncApplePhotosAlbumsKey)
     }
     
     var activeServerURL: String {
@@ -67,6 +71,7 @@ class SettingsManager: ObservableObject {
     }
     
     func login(serverURL: String, apiKey: String, internalServerURL: String? = nil, ssid: String? = nil) {
+        AlbumSyncService.invalidateInFlightSync()
         self.serverURL = serverURL
         self.internalServerURL = internalServerURL ?? ""
         self.internalNetworkSSID = ssid ?? ""
@@ -79,33 +84,57 @@ class SettingsManager: ObservableObject {
         if let ssid = ssid, !ssid.isEmpty {
             NetworkReachability.shared.configure(ssid: ssid)
         }
-        
+
         saveSettings()
         syncToSharedSettings()
+        scheduleAlbumSyncIfEnabled()
     }
-    
+
     func updateServerURL(_ url: String) {
+        guard url != self.serverURL else { return }
+        AlbumSyncService.invalidateInFlightSync()
         self.serverURL = url
         UserDefaults.standard.set(url, forKey: serverURLKey)
         syncToSharedSettings()
+        scheduleAlbumSyncIfEnabled()
     }
-    
+
     func updateInternalNetworkSettings(url: String, ssid: String) {
+        guard url != self.internalServerURL || ssid != self.internalNetworkSSID else { return }
+        AlbumSyncService.invalidateInFlightSync()
         self.internalServerURL = url
         self.internalNetworkSSID = ssid
-        
+
         UserDefaults.standard.set(url, forKey: internalServerURLKey)
         UserDefaults.standard.set(ssid, forKey: internalNetworkSSIDKey)
-        
+
         NetworkReachability.shared.configure(ssid: ssid.isEmpty ? nil : ssid)
-        
+
         syncToSharedSettings()
+        scheduleAlbumSyncIfEnabled()
     }
+
     func updateAllowCellularBackgroundUpload(_ allowed: Bool) {
         allowCellularBackgroundUpload = allowed
         UserDefaults.standard.set(allowed, forKey: allowCellularBackgroundUploadKey)
         syncToSharedSettings()
     }
+
+    private func scheduleAlbumSyncIfEnabled() {
+        guard isLoggedIn, syncApplePhotosAlbums else { return }
+        Task { await AlbumSyncService.shared.syncIfEnabled() }
+    }
+
+    func updateSyncApplePhotosAlbums(_ enabled: Bool) {
+        guard syncApplePhotosAlbums != enabled else { return }
+        AlbumSyncService.invalidateInFlightSync()
+        syncApplePhotosAlbums = enabled
+        UserDefaults.standard.set(enabled, forKey: Self.syncApplePhotosAlbumsKey)
+        if enabled {
+            scheduleAlbumSyncIfEnabled()
+        }
+    }
+
     
     private func syncToSharedSettings() {
         if #available(iOS 26.1, *) {
@@ -144,18 +173,21 @@ class SettingsManager: ObservableObject {
     }
 
     func logout() {
+        AlbumSyncService.invalidateInFlightSync()
         self.serverURL = ""
         self.internalServerURL = ""
         self.internalNetworkSSID = ""
         self.apiKey = ""
         self.isLoggedIn = false
         self.allowCellularBackgroundUpload = true
+        self.syncApplePhotosAlbums = false
         
         UserDefaults.standard.removeObject(forKey: serverURLKey)
         UserDefaults.standard.removeObject(forKey: internalServerURLKey)
         UserDefaults.standard.removeObject(forKey: internalNetworkSSIDKey)
-        UserDefaults.standard.removeObject(forKey: isLoggedInKey)
+        UserDefaults.standard.removeObject(forKey: Self.isLoggedInKey)
         UserDefaults.standard.removeObject(forKey: allowCellularBackgroundUploadKey)
+        UserDefaults.standard.removeObject(forKey: Self.syncApplePhotosAlbumsKey)
         deleteAPIKeyFromKeychain()
         
         // Clear SharedSettings and disable background upload

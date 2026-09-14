@@ -346,10 +346,9 @@ class ImmichAPIService: NSObject {
         }
         return delegate
     }
-    
-    func removeUploadDelegate(for taskId: Int) {
-        delegateQueue.async(flags: .barrier) {
-            self.uploadDelegates.removeValue(forKey: taskId)
+    private func removeUploadDelegate(for taskId: Int) {
+        delegateQueue.sync(flags: .barrier) {
+            uploadDelegates.removeValue(forKey: taskId)
         }
     }
     
@@ -704,6 +703,110 @@ class ImmichAPIService: NSObject {
         }
     }
     
+    func fetchOwnedAlbums(serverURL: String, apiKey: String) async throws -> [ImmichAlbum] {
+        guard var components = URLComponents(string: "\(serverURL)/api/albums") else {
+            throw ImmichAPIError.invalidURL
+        }
+        components.queryItems = [URLQueryItem(name: "isOwned", value: "true")]
+        guard let url = components.url else { throw ImmichAPIError.invalidURL }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        request.timeoutInterval = 30
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        try validateAlbumResponse(response, data: data, expectedStatusCodes: [200])
+        return try JSONDecoder().decode([ImmichAlbum].self, from: data)
+    }
+
+    func createAlbum(name: String, serverURL: String, apiKey: String) async throws -> ImmichAlbum {
+        guard let url = URL(string: "\(serverURL)/api/albums") else {
+            throw ImmichAPIError.invalidURL
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        request.timeoutInterval = 30
+        request.httpBody = try JSONSerialization.data(withJSONObject: ["albumName": name])
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        try validateAlbumResponse(response, data: data, expectedStatusCodes: [201])
+        return try JSONDecoder().decode(ImmichAlbum.self, from: data)
+    }
+
+    func addAssets(_ assetIds: [String], toAlbum albumId: String, serverURL: String, apiKey: String) async throws -> Set<String> {
+        guard !assetIds.isEmpty else { return [] }
+        guard let url = URL(string: "\(serverURL)/api/albums/\(albumId)/assets") else {
+            throw ImmichAPIError.invalidURL
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "PUT"
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        request.timeoutInterval = 60
+        request.httpBody = try JSONSerialization.data(withJSONObject: ["ids": assetIds])
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        try validateAlbumResponse(response, data: data, expectedStatusCodes: [200])
+        struct MembershipResult: Decodable {
+            let id: String
+            let success: Bool
+            let error: String?
+            let errorMessage: String?
+        }
+        struct MembershipResponse: Decodable {
+            let count: Int?
+            let results: [MembershipResult]?
+            let success: [String]?
+            let failed: [String]?
+        }
+
+        let decoder = JSONDecoder()
+        let accepted: Set<String>
+        var rejectionDetails: [String] = []
+        if let array = try? decoder.decode([MembershipResult].self, from: data) {
+            accepted = Set(array.filter { $0.success || $0.error == "duplicate" }.map(\.id))
+            rejectionDetails = array.filter { !$0.success && $0.error != "duplicate" }
+                .map { "\($0.id): \($0.errorMessage ?? $0.error ?? "missing from response")" }
+        } else if let wrapped = try? decoder.decode(MembershipResponse.self, from: data),
+                  let success = wrapped.success {
+            accepted = Set(success)
+        } else if let wrapped = try? decoder.decode(MembershipResponse.self, from: data),
+                  let failed = wrapped.failed {
+            accepted = Set(assetIds).subtracting(failed)
+        } else if let wrapped = try? decoder.decode(MembershipResponse.self, from: data),
+                  let results = wrapped.results {
+            accepted = Set(results.filter { $0.success || $0.error == "duplicate" }.map(\.id))
+            rejectionDetails = results.filter { !$0.success && $0.error != "duplicate" }
+                .map { "\($0.id): \($0.errorMessage ?? $0.error ?? "missing from response")" }
+        } else {
+            throw ImmichAPIError.invalidResponse
+        }
+
+        let rejected = Set(assetIds).subtracting(accepted)
+        if !rejected.isEmpty {
+            logWarning("Album \(albumId) rejected \(rejected.count) memberships: \(rejectionDetails.prefix(10).joined(separator: ", "))", category: .api)
+        }
+        return rejected
+    }
+
+    private func validateAlbumResponse(_ response: URLResponse, data: Data, expectedStatusCodes: Set<Int>) throws {
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw ImmichAPIError.invalidResponse
+        }
+        guard expectedStatusCodes.contains(httpResponse.statusCode) else {
+            let message = String(data: data, encoding: .utf8) ?? "Unknown error"
+            throw ImmichAPIError.serverError(statusCode: httpResponse.statusCode, message: message)
+        }
+    }
+
     /// Fetches all assets via sync stream (AssetsV2) without acknowledging checkpoints.
     func fetchAssetStream(serverURL: String, apiKey: String) async throws -> AssetStreamResult {
         logInfo("Fetching assets via sync stream", category: .api)
@@ -911,7 +1014,9 @@ class ImmichAPIService: NSObject {
             case "AssetV2":
                 guard let entityData = object["data"] as? [String: Any],
                       let id = entityData["id"] as? String,
-                      let checksum = entityData["checksum"] as? String
+                      let checksum = entityData["checksum"] as? String,
+                      let ownerId = entityData["ownerId"] as? String,
+                      !ownerId.isEmpty
                 else {
                     continue
                 }
@@ -921,7 +1026,7 @@ class ImmichAPIService: NSObject {
                     originalFileName: entityData["originalFileName"] as? String,
                     fileCreatedAt: entityData["fileCreatedAt"] as? String,
                     type: entityData["type"] as? String,
-                    ownerId: entityData["ownerId"] as? String,
+                    ownerId: ownerId,
                     deletedAt: entityData["deletedAt"] as? String
                 ))
                 collectLatestAck(from: object, into: &acksByType)
@@ -990,6 +1095,7 @@ class ImmichAPIService: NSObject {
     }
 
 
+
     func updateBulkAssetMetadata(items: [MetadataUpdateItem], serverURL: String, apiKey: String) async throws {
         guard !items.isEmpty else {
             logDebug("No metadata items to update", category: .api)
@@ -1037,6 +1143,10 @@ class ImmichAPIService: NSObject {
             throw error
         }
     }
+}
+struct ImmichAlbum: Decodable {
+    let id: String
+    let albumName: String
 }
 
 struct MetadataUpdateItem {

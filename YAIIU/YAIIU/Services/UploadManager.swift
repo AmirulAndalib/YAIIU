@@ -119,7 +119,7 @@ class UploadManager: ObservableObject {
     @Published var isUploading: Bool = false
     @Published var uploadedCount: Int = 0
     
-    private let photoLibraryManager = PhotoLibraryManager()
+    private let photoLibraryManager = PhotoLibraryManager.shared
     private var uploadTask: Task<Void, Never>?
     private var isPaused: Bool = false
     
@@ -309,6 +309,27 @@ class UploadManager: ObservableObject {
         }
         
         logInfo("Upload queue processing complete: \(successCount) succeeded, \(failCount) failed", category: .upload)
+        if successCount > 0 {
+            Task {
+                guard !settingsManager.activeServerURL.isEmpty, !settingsManager.apiKey.isEmpty else { return }
+                let serverSyncSucceeded = await withCheckedContinuation { continuation in
+                    ServerAssetSyncService.shared.syncServerAssets(
+                        serverURL: settingsManager.activeServerURL,
+                        apiKey: settingsManager.apiKey
+                    ) { result in
+                        let succeeded: Bool
+                        if case .success = result {
+                            succeeded = true
+                        } else {
+                            succeeded = false
+                        }
+                        continuation.resume(returning: succeeded)
+                    }
+                }
+                guard serverSyncSucceeded else { return }
+                await AlbumSyncService.shared.syncIfEnabled()
+            }
+        }
         
         await MainActor.run {
             isUploading = false
