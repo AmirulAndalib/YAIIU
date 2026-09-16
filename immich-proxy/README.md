@@ -49,6 +49,10 @@ Configuration is done via environment variables:
 POST /api/assets/background
 ```
 
+On iOS 27, PhotoKit first sends an `OPTIONS` capability request. The proxy
+returns `501 Not Implemented` so PhotoKit uses its standard non-resumable upload
+path; resumable uploads are not currently supported.
+
 ### Headers
 
 | Header               | Required | Description                                        |
@@ -92,7 +96,7 @@ go run .
 ```bash
 docker run -p 8080:8080 \
   -e IMMICH_SERVER_URL=http://your-immich-server:2283 \
-  fawenyo/immich-proxy:0.1.0
+  fawenyo/immich-proxy:latest
 ```
 
 Or build your own:
