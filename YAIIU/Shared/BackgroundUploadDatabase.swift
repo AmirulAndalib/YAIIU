@@ -165,6 +165,97 @@ final class BackgroundUploadDatabase {
         }
     }
 
+    func markJobStatus(assetId: String, resourceType: String, status: UploadJobStatus) {
+        queue.sync {
+            let sql = "UPDATE upload_jobs SET status = ?, updated_at = ? WHERE asset_id = ? AND resource_type = ?"
+            var stmt: OpaquePointer?
+            defer { sqlite3_finalize(stmt) }
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
+            sqlite3_bind_text(stmt, 1, status.rawValue, -1, SQLITE_TRANSIENT)
+            sqlite3_bind_double(stmt, 2, Date().timeIntervalSince1970)
+            sqlite3_bind_text(stmt, 3, assetId, -1, SQLITE_TRANSIENT)
+            sqlite3_bind_text(stmt, 4, resourceType, -1, SQLITE_TRANSIENT)
+            sqlite3_step(stmt)
+        }
+    }
+
+    // Removes tracked jobs (pending/uploading/failed) older than createdBefore whose
+    // resource key is absent from the live PhotoKit job set. Such rows represent jobs
+    // that vanished from PhotoKit (crash, expiry, library churn); leaving them would
+    // make fetchPendingResources skip their assets forever.
+    func pruneTrackedJobs(liveKeys: Set<String>, createdBefore: Date) -> Int {
+        queue.sync {
+            let cutoff = createdBefore.timeIntervalSince1970
+            let selectSql = """
+                SELECT id, asset_id, resource_type FROM upload_jobs
+                WHERE status IN ('pending', 'uploading', 'failed') AND created_at < ?
+            """
+            var stmt: OpaquePointer?
+            defer { sqlite3_finalize(stmt) }
+            guard sqlite3_prepare_v2(db, selectSql, -1, &stmt, nil) == SQLITE_OK else { return 0 }
+            sqlite3_bind_double(stmt, 1, cutoff)
+
+            var doomed: [Int64] = []
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                let id = Int64(sqlite3_column_int64(stmt, 0))
+                guard let aPtr = sqlite3_column_text(stmt, 1),
+                      let tPtr = sqlite3_column_text(stmt, 2) else { continue }
+                let key = "\(String(cString: aPtr))||\(String(cString: tPtr))"
+                if !liveKeys.contains(key) { doomed.append(id) }
+            }
+            guard !doomed.isEmpty else { return 0 }
+
+            sqlite3_exec(db, "BEGIN TRANSACTION", nil, nil, nil)
+            let deleteSql = "DELETE FROM upload_jobs WHERE id = ?"
+            for id in doomed {
+                var del: OpaquePointer?
+                if sqlite3_prepare_v2(db, deleteSql, -1, &del, nil) == SQLITE_OK {
+                    sqlite3_bind_int64(del, 1, id)
+                    sqlite3_step(del)
+                }
+                sqlite3_finalize(del)
+            }
+            sqlite3_exec(db, "COMMIT", nil, nil, nil)
+            return doomed.count
+        }
+    }
+
+    // Removes a tracking row entirely so createOrUpdateJob can re-insert it for a
+    // replacement job; a completed-status row would be skipped by the upsert and a
+    // failed-status row would keep the resource classified as inflight.
+    func deleteTrackedJob(assetId: String, resourceType: String) {
+        queue.sync {
+            let sql = "DELETE FROM upload_jobs WHERE asset_id = ? AND resource_type = ?"
+            var stmt: OpaquePointer?
+            defer { sqlite3_finalize(stmt) }
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return }
+            sqlite3_bind_text(stmt, 1, assetId, -1, SQLITE_TRANSIENT)
+            sqlite3_bind_text(stmt, 2, resourceType, -1, SQLITE_TRANSIENT)
+            sqlite3_step(stmt)
+        }
+    }
+
+    // Creation timestamps of locally tracked jobs, keyed "assetId||resourceType".
+    func getTrackedJobAges() -> [String: Date] {
+        queue.sync {
+            var ages = [String: Date]()
+            let sql = """
+                SELECT asset_id, resource_type, created_at FROM upload_jobs
+                WHERE status IN ('pending', 'uploading', 'failed')
+            """
+            var stmt: OpaquePointer?
+            defer { sqlite3_finalize(stmt) }
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return ages }
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                guard let aPtr = sqlite3_column_text(stmt, 0),
+                      let tPtr = sqlite3_column_text(stmt, 1) else { continue }
+                let key = "\(String(cString: aPtr))||\(String(cString: tPtr))"
+                ages[key] = Date(timeIntervalSince1970: sqlite3_column_double(stmt, 2))
+            }
+            return ages
+        }
+    }
+
     func getInflightJobKeys() -> Set<String> {
         queue.sync {
             var keys = Set<String>()
@@ -214,11 +305,12 @@ final class BackgroundUploadDatabase {
             
             sqlite3_step(stmt)
             
-            // Mark as on server in hash cache
-            let updateSql = "UPDATE hash_cache SET is_on_server = 1, checked_at = ? WHERE asset_id = ?"
+            // Per-resource server flags: raw uploads confirm only the raw copy.
+            let flagColumn = resourceType == "raw" ? "raw_on_server" : "is_on_server"
+            let updateSql = "UPDATE hash_cache SET \(flagColumn) = 1, checked_at = ? WHERE asset_id = ?"
             var updateStmt: OpaquePointer?
             defer { sqlite3_finalize(updateStmt) }
-            
+
             if sqlite3_prepare_v2(db, updateSql, -1, &updateStmt, nil) == SQLITE_OK {
                 sqlite3_bind_double(updateStmt, 1, Date().timeIntervalSince1970)
                 sqlite3_bind_text(updateStmt, 2, assetId, -1, SQLITE_TRANSIENT)
@@ -389,34 +481,76 @@ final class BackgroundUploadDatabase {
         }
     }
     
+    // Whole assets fully represented on the server: the primary copy is confirmed
+    // and, where the hash cache knows a raw sibling exists, that copy is confirmed
+    // too. Assets with an unconfirmed raw sibling stay discoverable so the sibling
+    // can be retried; per-resource uploads still gate on uploaded_assets.
     func getAllAssetsOnServer() -> Set<String> {
         queue.sync {
             var ids = Set<String>()
-            
-            // From assets_on_server table
+
+            let sql = """
+                SELECT asset_id FROM hash_cache
+                WHERE is_on_server = 1 AND (has_raw = 0 OR raw_on_server = 1)
+                UNION
+                SELECT asset_id FROM assets_on_server
+                WHERE asset_id NOT IN
+                    (SELECT asset_id FROM hash_cache WHERE has_raw = 1 AND raw_on_server = 0)
+            """
+
             var stmt: OpaquePointer?
-            let sql1 = "SELECT asset_id FROM assets_on_server"
-            if sqlite3_prepare_v2(db, sql1, -1, &stmt, nil) == SQLITE_OK {
-                while sqlite3_step(stmt) == SQLITE_ROW {
-                    if let cStr = sqlite3_column_text(stmt, 0) {
-                        ids.insert(String(cString: cStr))
-                    }
+            defer { sqlite3_finalize(stmt) }
+
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return ids }
+
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                if let cStr = sqlite3_column_text(stmt, 0) {
+                    ids.insert(String(cString: cStr))
                 }
             }
-            sqlite3_finalize(stmt)
-            
-            // Also check hash_cache for confirmed uploads
-            let sql2 = "SELECT asset_id FROM hash_cache WHERE is_on_server = 1"
-            if sqlite3_prepare_v2(db, sql2, -1, &stmt, nil) == SQLITE_OK {
-                while sqlite3_step(stmt) == SQLITE_ROW {
-                    if let cStr = sqlite3_column_text(stmt, 0) {
-                        ids.insert(String(cString: cStr))
-                    }
-                }
-            }
-            sqlite3_finalize(stmt)
-            
             return ids
+        }
+    }
+
+    // Assets whose server state is partial: the primary copy is confirmed while a
+    // known raw sibling is not, or vice versa. Bulk skip (getAllAssetsOnServer) only
+    // covers fully-confirmed assets; discovery filters each copy of a partial asset
+    // with these sets so the missing copy can be (re)scheduled without reuploading
+    // the confirmed one.
+    func getPartialServerCopyAssets() -> (primaryConfirmed: Set<String>, rawConfirmed: Set<String>) {
+        queue.sync {
+            var primaryConfirmed = Set<String>()
+            var rawConfirmed = Set<String>()
+
+            let sql = """
+                SELECT asset_id, CASE WHEN is_on_server = 1 THEN 'p' ELSE 'r' END
+                FROM hash_cache
+                WHERE (is_on_server = 1 AND has_raw = 1 AND raw_on_server = 0)
+                   OR (raw_on_server = 1 AND is_on_server = 0)
+                UNION ALL
+                SELECT asset_id, 'p' FROM assets_on_server
+                WHERE asset_id IN
+                    (SELECT asset_id FROM hash_cache WHERE has_raw = 1 AND raw_on_server = 0)
+            """
+
+            var stmt: OpaquePointer?
+            defer { sqlite3_finalize(stmt) }
+
+            guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+                return (primaryConfirmed, rawConfirmed)
+            }
+
+            while sqlite3_step(stmt) == SQLITE_ROW {
+                guard let idPtr = sqlite3_column_text(stmt, 0),
+                      let kindPtr = sqlite3_column_text(stmt, 1) else { continue }
+                let assetId = String(cString: idPtr)
+                if String(cString: kindPtr) == "p" {
+                    primaryConfirmed.insert(assetId)
+                } else {
+                    rawConfirmed.insert(assetId)
+                }
+            }
+            return (primaryConfirmed, rawConfirmed)
         }
     }
     
