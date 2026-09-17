@@ -94,25 +94,26 @@ final class BackgroundUploadExtensionCore {
 
     private func processUploadJobs() throws -> NewUploadJobsResult {
         guard settings.isLoggedIn, settings.backgroundUploadEnabled else {
+            logDebug("Skipping run: logged in=\(settings.isLoggedIn), background upload enabled=\(settings.backgroundUploadEnabled)")
             return .completed
         }
 
-        // Reconcile first so rows freed from vanished PhotoKit jobs become
-        // rediscoverable within this same run.
-        var madeProgress = reconcileTrackedJobs() > 0
+        // Stage markers: the system can terminate the extension at any point
+        // without a crash report; per-stage boundaries show how far a run got.
+        var madeProgress = timeStage("reconcile") { reconcileTrackedJobs() > 0 }
         guard !isCancelled else { return .deferred }
 
-        madeProgress = try retryFailedJobs() || madeProgress
+        madeProgress = try timeStage("retry") { try retryFailedJobs() } || madeProgress
         guard !isCancelled else { return .deferred }
 
-        let acknowledgement = try acknowledgeCompletedJobs()
+        let acknowledgement = try timeStage("acknowledge") { try acknowledgeCompletedJobs() }
         madeProgress = acknowledgement.acknowledged || madeProgress
         guard !isCancelled else { return .deferred }
 
-        madeProgress = cancelRedundantJobs() || madeProgress
+        madeProgress = timeStage("cancel") { cancelRedundantJobs() } || madeProgress
         guard !isCancelled else { return .deferred }
 
-        let result = try createNewUploadJobs(interface: currentNetworkInterface())
+        let result = try timeStage("create") { try createNewUploadJobs(interface: currentNetworkInterface()) }
         guard result == .completed else { return result }
 
         // Unacknowledged terminal jobs still consume the job limit; request another
@@ -120,6 +121,17 @@ final class BackgroundUploadExtensionCore {
         if acknowledgement.pending { return .deferred }
 
         return madeProgress || hasJobsInFlight() ? .scheduled : .completed
+    }
+
+    private func timeStage<T>(_ name: String, _ body: () throws -> T) rethrows -> T {
+        let started = Date()
+        defer {
+            let elapsed = Date().timeIntervalSince(started)
+            let line = "Stage \(name) finished in \(String(format: "%.1f", elapsed))s"
+            if elapsed > 1 { log(line) } else { logDebug(line) }
+        }
+        logDebug("Stage \(name) starting")
+        return try body()
     }
 
     private func hasJobsInFlight() -> Bool {
@@ -369,10 +381,6 @@ final class BackgroundUploadExtensionCore {
     private func createNewUploadJobs(
         interface: BackgroundUploadNetworkInterface
     ) throws -> NewUploadJobsResult {
-        let resources = fetchPendingResources()
-        logDebug("Found \(resources.count) pending resources for upload")
-        guard !resources.isEmpty else { return .completed }
-
         switch interface {
         case .unknown:
             logDebug("Deferring new background upload jobs because network path is unknown")
@@ -397,6 +405,16 @@ final class BackgroundUploadExtensionCore {
             logWarning("PhotoKit job limit already reached; waiting for acknowledgements before creating new jobs")
             return .remaining
         }
+
+        // Discover only what a batch needs: a full library scan (per-asset
+        // PHAssetResource.assetResources) outlives the extension's execution
+        // budget and gets the process killed before any job is created.
+        let discovery = fetchPendingResources(limit: max(capacity * 2, 20))
+        logDebug("Found \(discovery.resources.count) pending resources for upload (complete scan: \(discovery.complete))")
+        guard !discovery.resources.isEmpty else {
+            return discovery.complete ? .completed : .remaining
+        }
+        let resources = discovery.resources
         // Keep an asset's resources in the same batch: splitting a JPEG/raw asset lets
         // the first success's asset-wide server bookkeeping hide the sibling that was
         // never scheduled.
@@ -423,7 +441,9 @@ final class BackgroundUploadExtensionCore {
             logWarning("Remaining pending assets need more capacity than available; deferring whole groups")
             return .remaining
         }
-        let truncated = batch.count < resources.count
+        // An incomplete discovery scan (limit or time budget hit) means unscheduled
+        // resources remain beyond what this batch was built from.
+        let truncated = batch.count < resources.count || !discovery.complete
         if truncated {
             logDebug("Capped new jobs to \(batch.count) of \(resources.count) pending to respect job limit")
         }
@@ -470,8 +490,18 @@ final class BackgroundUploadExtensionCore {
     }
 
     // MARK: - Resource Discovery
+    private struct DiscoveryResult {
+        let resources: [PHAssetResource]
+        // False when the scan stopped on the count limit or time budget; the
+        // caller must treat work as still pending rather than exhausted.
+        let complete: Bool
+    }
 
-    private func fetchPendingResources() -> [PHAssetResource] {
+    // Per-run wall-clock budget for library discovery; the system kills the
+    // extension without a crash report when a run overruns its execution budget.
+    private let discoveryTimeBudget: TimeInterval = 20
+
+    private func fetchPendingResources(limit: Int) -> DiscoveryResult {
         let skip = database.getAllAssetsOnServer()
         let partial = database.getPartialServerCopyAssets()
         let inflightKeys = database.getInflightJobKeys()
@@ -483,10 +513,23 @@ final class BackgroundUploadExtensionCore {
 
         let allAssets = PHAsset.fetchAssets(with: .image, options: opts)
         let allVideos = PHAsset.fetchAssets(with: .video, options: opts)
+        logDebug("Discovery: \(allAssets.count) image, \(allVideos.count) video assets")
 
         var pending = [PHAssetResource]()
+        var scanned = 0
+        var stoppedEarly = false
+        let scanStart = Date()
+        let scanDeadline = scanStart.addingTimeInterval(discoveryTimeBudget)
+        var lastProgressLog = scanStart
 
+        // Logs BEFORE the per-asset PHAssetResource.assetResources call: a hung
+        // fetch shows up as progress stopping at a specific scanned count.
         let collect: (PHAsset) -> Void = { asset in
+            scanned += 1
+            if Date().timeIntervalSince(lastProgressLog) >= 2 {
+                lastProgressLog = Date()
+                self.log("Discovery progress: scanned \(scanned), found \(pending.count) pending")
+            }
             let resources = PHAssetResource.assetResources(for: asset)
             for r in resources where self.shouldUpload(r) {
                 let type = self.resourceTypeString(for: r)
@@ -508,26 +551,23 @@ final class BackgroundUploadExtensionCore {
             }
         }
 
-        allAssets.enumerateObjects { asset, _, stop in
-            if self.isCancelled {
-                stop.pointee = true
-                return
+        let enumerate: (PHFetchResult<PHAsset>) -> Void = { fetchResult in
+            fetchResult.enumerateObjects { asset, _, stop in
+                if self.isCancelled || pending.count >= limit || Date() >= scanDeadline {
+                    stoppedEarly = true
+                    stop.pointee = true
+                    return
+                }
+                guard !skip.contains(asset.localIdentifier) else { return }
+                collect(asset)
             }
-            guard !skip.contains(asset.localIdentifier) else { return }
-            collect(asset)
         }
+        enumerate(allAssets)
+        if !stoppedEarly { enumerate(allVideos) }
 
-        allVideos.enumerateObjects { asset, _, stop in
-            if self.isCancelled {
-                stop.pointee = true
-                return
-            }
-            guard !skip.contains(asset.localIdentifier) else { return }
-            collect(asset)
-        }
-        logDebug("Collected \(pending.count) pending resources")
-
-        return pending
+        let elapsed = Date().timeIntervalSince(scanStart)
+        logDebug("Discovery collected \(pending.count) pending resources in \(String(format: "%.1f", elapsed))s (complete: \(!stoppedEarly))")
+        return DiscoveryResult(resources: pending, complete: !stoppedEarly)
     }
 
 
@@ -890,7 +930,9 @@ final class BackgroundUploadExtensionCore {
             message: message
         )
         print(formatted)
-        logFileWriter?.appendLine(formatted)
+        // Synchronous write: the system kills this process without warning, and an
+        // async queue would drop the very lines that record how far a run got.
+        logFileWriter?.appendSync(timestamp: Date(), level: level, category: Self.logCategory, message: message)
     }
     
     private func logDebug(_ message: String) {
