@@ -25,10 +25,11 @@ final class ServerAssetRepository {
             
             let sql = """
             INSERT INTO server_assets_cache
-            (immich_id, checksum, original_filename, asset_type, updated_at, synced_at, icloud_id, owner_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            (immich_id, checksum, source_checksum, original_filename, asset_type, updated_at, synced_at, icloud_id, owner_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(immich_id) DO UPDATE SET
                 checksum = excluded.checksum,
+                source_checksum = COALESCE(excluded.source_checksum, server_assets_cache.source_checksum),
                 original_filename = excluded.original_filename,
                 asset_type = excluded.asset_type,
                 updated_at = excluded.updated_at,
@@ -49,36 +50,42 @@ final class ServerAssetRepository {
                 sqlite3_bind_text(statement, 1, (asset.immichId as NSString).utf8String, -1, nil)
                 sqlite3_bind_text(statement, 2, (asset.checksum as NSString).utf8String, -1, nil)
 
-                if let filename = asset.originalFilename {
-                    sqlite3_bind_text(statement, 3, (filename as NSString).utf8String, -1, nil)
+                if let sourceChecksum = asset.sourceChecksum {
+                    sqlite3_bind_text(statement, 3, (sourceChecksum as NSString).utf8String, -1, nil)
                 } else {
                     sqlite3_bind_null(statement, 3)
                 }
 
-                if let type = asset.assetType {
-                    sqlite3_bind_text(statement, 4, (type as NSString).utf8String, -1, nil)
+                if let filename = asset.originalFilename {
+                    sqlite3_bind_text(statement, 4, (filename as NSString).utf8String, -1, nil)
                 } else {
                     sqlite3_bind_null(statement, 4)
                 }
 
-                if let updatedAt = asset.updatedAt {
-                    sqlite3_bind_text(statement, 5, (updatedAt as NSString).utf8String, -1, nil)
+                if let type = asset.assetType {
+                    sqlite3_bind_text(statement, 5, (type as NSString).utf8String, -1, nil)
                 } else {
                     sqlite3_bind_null(statement, 5)
                 }
 
-                sqlite3_bind_double(statement, 6, syncTime)
+                if let updatedAt = asset.updatedAt {
+                    sqlite3_bind_text(statement, 6, (updatedAt as NSString).utf8String, -1, nil)
+                } else {
+                    sqlite3_bind_null(statement, 6)
+                }
+
+                sqlite3_bind_double(statement, 7, syncTime)
 
                 if let iCloudId = asset.iCloudId {
-                    sqlite3_bind_text(statement, 7, (iCloudId as NSString).utf8String, -1, nil)
+                    sqlite3_bind_text(statement, 8, (iCloudId as NSString).utf8String, -1, nil)
                 } else {
-                    sqlite3_bind_null(statement, 7)
+                    sqlite3_bind_null(statement, 8)
                 }
 
                 if let ownerId = asset.ownerId {
-                    sqlite3_bind_text(statement, 8, (ownerId as NSString).utf8String, -1, nil)
+                    sqlite3_bind_text(statement, 9, (ownerId as NSString).utf8String, -1, nil)
                 } else {
-                    sqlite3_bind_null(statement, 8)
+                    sqlite3_bind_null(statement, 9)
                 }
 
                 if sqlite3_step(statement) != SQLITE_DONE {
@@ -204,6 +211,98 @@ final class ServerAssetRepository {
         }
     }
 
+    /// Attach source checksums delivered by AssetMetadataV1 events for rows
+    /// already in the cache. Rows missing from the cache are skipped; their
+    /// checksum arrives with the AssetV2 event instead.
+    @discardableResult
+    func updateSourceChecksums(_ sourceChecksumsByImmichId: [String: String]) -> Bool {
+        guard !sourceChecksumsByImmichId.isEmpty else { return true }
+
+        return connection.dbQueue.sync { [weak self] in
+            guard let self = self else { return false }
+
+            guard self.connection.beginTransaction() else {
+                logError("Failed to begin source checksum update transaction: \(self.connection.lastErrorMessage)", category: .database)
+                return false
+            }
+            let sql = "UPDATE server_assets_cache SET source_checksum = ? WHERE immich_id = ?;"
+            var statement: OpaquePointer?
+            var failed = false
+
+            guard sqlite3_prepare_v2(self.connection.db, sql, -1, &statement, nil) == SQLITE_OK else {
+                self.connection.rollbackTransaction()
+                logError("Failed to prepare source checksum updates: \(self.connection.lastErrorMessage)", category: .database)
+                return false
+            }
+
+            for (immichId, sourceChecksum) in sourceChecksumsByImmichId {
+                sqlite3_bind_text(statement, 1, (sourceChecksum as NSString).utf8String, -1, nil)
+                sqlite3_bind_text(statement, 2, (immichId as NSString).utf8String, -1, nil)
+                if sqlite3_step(statement) != SQLITE_DONE {
+                    failed = true
+                    logError("Failed to update source checksum: \(self.connection.lastErrorMessage)", category: .database)
+                    break
+                }
+                sqlite3_reset(statement)
+                sqlite3_clear_bindings(statement)
+            }
+
+            sqlite3_finalize(statement)
+            if failed {
+                self.connection.rollbackTransaction()
+                return false
+            }
+
+            guard self.connection.commitTransaction() else {
+                logError("Failed to commit source checksum updates: \(self.connection.lastErrorMessage)", category: .database)
+                self.connection.rollbackTransaction()
+                return false
+            }
+            logInfo("Updated source checksums for \(sourceChecksumsByImmichId.count) cached assets", category: .database)
+            return true
+        }
+    }
+
+    /// Returns source checksums held by the cache for the given assets.
+    /// Missing rows and rows without a checksum are omitted.
+    func sourceChecksums(for immichIds: [String]) -> [String: String] {
+        guard !immichIds.isEmpty else { return [:] }
+        connection.ensureInitialized()
+        var result: [String: String] = [:]
+        let chunkSize = 500
+        for chunkStart in stride(from: 0, to: immichIds.count, by: chunkSize) {
+            let chunk = Array(immichIds[chunkStart..<min(chunkStart + chunkSize, immichIds.count)])
+            connection.dbQueue.sync { [weak self] in
+                guard let self else { return }
+                let values = Array(repeating: "(?)", count: chunk.count).joined(separator: ",")
+                let sql = """
+                SELECT immich_id, source_checksum
+                FROM server_assets_cache
+                WHERE immich_id IN (VALUES \(values)) AND source_checksum IS NOT NULL;
+                """
+                var statement: OpaquePointer?
+                defer { sqlite3_finalize(statement) }
+                guard sqlite3_prepare_v2(self.connection.db, sql, -1, &statement, nil) == SQLITE_OK else {
+                    logError("Failed to prepare source checksum lookup: \(self.connection.lastErrorMessage)", category: .database)
+                    return
+                }
+                let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+                for (index, immichId) in chunk.enumerated() {
+                    _ = immichId.withCString { value in
+                        sqlite3_bind_text(statement, Int32(index + 1), value, -1, transient)
+                    }
+                }
+                while sqlite3_step(statement) == SQLITE_ROW {
+                    let immichId = String(cString: sqlite3_column_text(statement, 0))
+                    if let checksum = sqlite3_column_text(statement, 1).map({ String(cString: $0) }) {
+                        result[immichId] = checksum
+                    }
+                }
+            }
+        }
+        return result
+    }
+
     // MARK: - Delete Methods
     
     @discardableResult
@@ -256,21 +355,28 @@ final class ServerAssetRepository {
     
     // MARK: - Query Methods
     
+    /// Rows are matched by source checksum first, then by server checksum for
+    /// rows without one (equivalent to COALESCE(source_checksum, checksum) = ?
+    /// while keeping both branches on their expression-free indexes).
     func isAssetOnServer(checksum: String) -> Bool {
         var exists = false
         
         connection.dbQueue.sync { [weak self] in
             guard let self = self else { return }
             
-            let sql = "SELECT COUNT(*) FROM server_assets_cache WHERE checksum = ?;"
+            let sql = """
+            SELECT 1 FROM server_assets_cache WHERE source_checksum = ?
+            UNION ALL
+            SELECT 1 FROM server_assets_cache WHERE checksum = ? AND source_checksum IS NULL
+            LIMIT 1;
+            """
             var statement: OpaquePointer?
             
             if sqlite3_prepare_v2(self.connection.db, sql, -1, &statement, nil) == SQLITE_OK {
                 sqlite3_bind_text(statement, 1, (checksum as NSString).utf8String, -1, nil)
+                sqlite3_bind_text(statement, 2, (checksum as NSString).utf8String, -1, nil)
                 
-                if sqlite3_step(statement) == SQLITE_ROW {
-                    exists = sqlite3_column_int(statement, 0) > 0
-                }
+                exists = sqlite3_step(statement) == SQLITE_ROW
             }
             sqlite3_finalize(statement)
         }
@@ -284,21 +390,30 @@ final class ServerAssetRepository {
         connection.dbQueue.sync { [weak self] in
             guard let self = self else { return }
             
-            let sql = "SELECT immich_id, checksum, original_filename, asset_type, updated_at, icloud_id, owner_id FROM server_assets_cache WHERE checksum = ? LIMIT 1;"
+            let sql = """
+            SELECT immich_id, checksum, source_checksum, original_filename, asset_type, updated_at, icloud_id, owner_id
+            FROM server_assets_cache WHERE source_checksum = ?
+            UNION ALL
+            SELECT immich_id, checksum, source_checksum, original_filename, asset_type, updated_at, icloud_id, owner_id
+            FROM server_assets_cache WHERE checksum = ? AND source_checksum IS NULL
+            LIMIT 1;
+            """
             var statement: OpaquePointer?
 
             if sqlite3_prepare_v2(self.connection.db, sql, -1, &statement, nil) == SQLITE_OK {
                 sqlite3_bind_text(statement, 1, (checksum as NSString).utf8String, -1, nil)
+                sqlite3_bind_text(statement, 2, (checksum as NSString).utf8String, -1, nil)
 
                 if sqlite3_step(statement) == SQLITE_ROW {
                     asset = ServerAssetRecord(
                         immichId: String(cString: sqlite3_column_text(statement, 0)),
                         checksum: String(cString: sqlite3_column_text(statement, 1)),
-                        originalFilename: sqlite3_column_text(statement, 2).map { String(cString: $0) },
-                        assetType: sqlite3_column_text(statement, 3).map { String(cString: $0) },
-                        updatedAt: sqlite3_column_text(statement, 4).map { String(cString: $0) },
-                        iCloudId: sqlite3_column_text(statement, 5).map { String(cString: $0) },
-                        ownerId: sqlite3_column_text(statement, 6).map { String(cString: $0) }
+                        sourceChecksum: sqlite3_column_text(statement, 2).map { String(cString: $0) },
+                        originalFilename: sqlite3_column_text(statement, 3).map { String(cString: $0) },
+                        assetType: sqlite3_column_text(statement, 4).map { String(cString: $0) },
+                        updatedAt: sqlite3_column_text(statement, 5).map { String(cString: $0) },
+                        iCloudId: sqlite3_column_text(statement, 6).map { String(cString: $0) },
+                        ownerId: sqlite3_column_text(statement, 7).map { String(cString: $0) }
                     )
                 }
             }
@@ -307,6 +422,37 @@ final class ServerAssetRepository {
         
         return asset
     }
+    func getServerAssetByImmichId(_ immichId: String) -> ServerAssetRecord? {
+        var asset: ServerAssetRecord?
+
+        connection.dbQueue.sync { [weak self] in
+            guard let self else { return }
+
+            let sql = "SELECT immich_id, checksum, source_checksum, original_filename, asset_type, updated_at, icloud_id, owner_id FROM server_assets_cache WHERE immich_id = ? LIMIT 1;"
+            var statement: OpaquePointer?
+
+            if sqlite3_prepare_v2(self.connection.db, sql, -1, &statement, nil) == SQLITE_OK {
+                sqlite3_bind_text(statement, 1, (immichId as NSString).utf8String, -1, nil)
+
+                if sqlite3_step(statement) == SQLITE_ROW {
+                    asset = ServerAssetRecord(
+                        immichId: String(cString: sqlite3_column_text(statement, 0)),
+                        checksum: String(cString: sqlite3_column_text(statement, 1)),
+                        sourceChecksum: sqlite3_column_text(statement, 2).map { String(cString: $0) },
+                        originalFilename: sqlite3_column_text(statement, 3).map { String(cString: $0) },
+                        assetType: sqlite3_column_text(statement, 4).map { String(cString: $0) },
+                        updatedAt: sqlite3_column_text(statement, 5).map { String(cString: $0) },
+                        iCloudId: sqlite3_column_text(statement, 6).map { String(cString: $0) },
+                        ownerId: sqlite3_column_text(statement, 7).map { String(cString: $0) }
+                    )
+                }
+            }
+            sqlite3_finalize(statement)
+        }
+
+        return asset
+    }
+
     
     /// Find a server asset by its iCloud ID.
     /// Used to check if another device has already uploaded a photo with the same iCloud ID.
@@ -316,7 +462,7 @@ final class ServerAssetRepository {
         connection.dbQueue.sync { [weak self] in
             guard let self = self else { return }
             
-            let sql = "SELECT immich_id, checksum, original_filename, asset_type, updated_at, icloud_id, owner_id FROM server_assets_cache WHERE icloud_id = ? LIMIT 1;"
+            let sql = "SELECT immich_id, checksum, source_checksum, original_filename, asset_type, updated_at, icloud_id, owner_id FROM server_assets_cache WHERE icloud_id = ? LIMIT 1;"
             var statement: OpaquePointer?
 
             if sqlite3_prepare_v2(self.connection.db, sql, -1, &statement, nil) == SQLITE_OK {
@@ -326,11 +472,12 @@ final class ServerAssetRepository {
                     asset = ServerAssetRecord(
                         immichId: String(cString: sqlite3_column_text(statement, 0)),
                         checksum: String(cString: sqlite3_column_text(statement, 1)),
-                        originalFilename: sqlite3_column_text(statement, 2).map { String(cString: $0) },
-                        assetType: sqlite3_column_text(statement, 3).map { String(cString: $0) },
-                        updatedAt: sqlite3_column_text(statement, 4).map { String(cString: $0) },
-                        iCloudId: sqlite3_column_text(statement, 5).map { String(cString: $0) },
-                        ownerId: sqlite3_column_text(statement, 6).map { String(cString: $0) }
+                        sourceChecksum: sqlite3_column_text(statement, 2).map { String(cString: $0) },
+                        originalFilename: sqlite3_column_text(statement, 3).map { String(cString: $0) },
+                        assetType: sqlite3_column_text(statement, 4).map { String(cString: $0) },
+                        updatedAt: sqlite3_column_text(statement, 5).map { String(cString: $0) },
+                        iCloudId: sqlite3_column_text(statement, 6).map { String(cString: $0) },
+                        ownerId: sqlite3_column_text(statement, 7).map { String(cString: $0) }
                     )
                 }
             }
@@ -348,7 +495,7 @@ final class ServerAssetRepository {
         connection.dbQueue.sync { [weak self] in
             guard let self = self else { return }
             
-            let sql = "SELECT checksum FROM server_assets_cache WHERE icloud_id = ? LIMIT 1;"
+            let sql = "SELECT COALESCE(source_checksum, checksum) FROM server_assets_cache WHERE icloud_id = ? LIMIT 1;"
             var statement: OpaquePointer?
             
             if sqlite3_prepare_v2(self.connection.db, sql, -1, &statement, nil) == SQLITE_OK {
@@ -381,7 +528,7 @@ final class ServerAssetRepository {
                 let currentBatch = Array(iCloudIds[batch..<endIndex])
                 
                 let placeholders = currentBatch.map { _ in "?" }.joined(separator: ",")
-                let sql = "SELECT icloud_id, checksum FROM server_assets_cache WHERE icloud_id IN (\(placeholders));"
+                let sql = "SELECT icloud_id, COALESCE(source_checksum, checksum) FROM server_assets_cache WHERE icloud_id IN (\(placeholders));"
                 
                 var statement: OpaquePointer?
                 if sqlite3_prepare_v2(self.connection.db, sql, -1, &statement, nil) == SQLITE_OK {

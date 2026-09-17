@@ -223,6 +223,11 @@ final class DatabaseManager {
     func clearICloudIds(for immichIds: Set<String>) -> Bool {
         serverRepo.clearICloudIds(for: immichIds)
     }
+
+    @discardableResult
+    func updateSourceChecksums(_ sourceChecksumsByImmichId: [String: String]) -> Bool {
+        serverRepo.updateSourceChecksums(sourceChecksumsByImmichId)
+    }
     
     @discardableResult
     func deleteServerAssets(_ immichIds: [String]) -> Bool {
@@ -235,6 +240,12 @@ final class DatabaseManager {
     
     func getServerAssetByChecksum(_ checksum: String) -> ServerAssetRecord? {
         serverRepo.getServerAssetByChecksum(checksum)
+    }
+    func getServerAssetByImmichId(_ immichId: String) -> ServerAssetRecord? {
+        serverRepo.getServerAssetByImmichId(immichId)
+    }
+    func sourceChecksums(for immichIds: [String]) -> [String: String] {
+        serverRepo.sourceChecksums(for: immichIds)
     }
     
     func getServerAssetsCacheCount() -> Int {

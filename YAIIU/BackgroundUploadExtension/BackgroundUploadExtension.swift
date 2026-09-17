@@ -1,5 +1,6 @@
 import CoreLocation
 import ExtensionFoundation
+import MapKit
 import Network
 import Photos
 import UniformTypeIdentifiers
@@ -26,6 +27,7 @@ final class BackgroundUploadExtensionCore {
     private var currentPath: NWPath?
     private var hasReceivedInitialPath = false
     private let appGroupID = "group.com.fawenyo.yaiiu"
+    private let immichAssetIDHeader = "x-yaiiu-immich-asset-id"
 
     private var isCancelled: Bool {
         cancelledState.withLock { $0 }
@@ -122,20 +124,39 @@ final class BackgroundUploadExtensionCore {
             options: nil
         )
 
+        var retryResources = [(job: PHAssetResourceUploadJob, resource: PHAssetResource)]()
         for i in 0..<jobs.count where !isCancelled {
             let job = jobs.object(at: i)
-            // Build destination first; if PHAsset is temporarily unavailable (e.g.
-            // PHPhotosError 3300 during iCloud sync), skip this job rather than calling
-            // retry(destination: nil) which strips all custom headers and causes the
-            // proxy to fall back to "upload.jpg".
-            guard let destination = buildDestination(for: job.resource) else {
-                logWarning("Skipping retry for \(job.resource.originalFilename): PHAsset temporarily unavailable")
+            guard let resource = resource(for: job) else {
+                logWarning("Skipping retry for job \(job.localIdentifier): PHAssetResource unavailable")
+                continue
+            }
+            retryResources.append((job, resource))
+        }
+
+        // Rebuild destinations from current settings; job.destination may carry a
+        // stale server URL or credential from before a logout/login or server move.
+        let timezones = captureTimezones(for: retryResources.map(\.resource))
+        guard !isCancelled else { return false }
+
+        for (job, resource) in retryResources where !isCancelled {
+            let errorDescription = jobErrorDescription(job)
+            logWarning("Retrying failed upload job \(job.localIdentifier): \(errorDescription)")
+
+            // If PHAsset is temporarily unavailable (e.g. PHPhotosError 3300 during
+            // iCloud sync), skip this job rather than retrying against a stale or
+            // credential-less destination.
+            guard let destination = buildDestination(
+                for: resource,
+                timezone: timezones[resource.assetLocalIdentifier] ?? TimeZone.current,
+                purpose: .retry
+            ) else {
+                logWarning("Skipping retry for \(resource.originalFilename): destination unavailable")
                 continue
             }
             try library.performChangesAndWait {
-                guard let req = PHAssetResourceUploadJobChangeRequest(for: job)
-                else { return }
-                req.retry(destination: destination)
+                guard let request = PHAssetResourceUploadJobChangeRequest(for: job) else { return }
+                request.retry(destination: destination)
                 retriedAny = true
             }
         }
@@ -149,10 +170,16 @@ final class BackgroundUploadExtensionCore {
             options: nil
         )
 
-        // Batch-fetch all assets to avoid per-item fetch in resolvedFilename()
+        var jobResources = [(job: PHAssetResourceUploadJob, resource: PHAssetResource)]()
         var identifiers = [String]()
         for i in 0..<jobs.count {
-            identifiers.append(jobs.object(at: i).resource.assetLocalIdentifier)
+            let job = jobs.object(at: i)
+            guard let resource = resource(for: job) else {
+                logWarning("Could not resolve resource for completed job \(job.localIdentifier); deferring acknowledgement")
+                continue
+            }
+            jobResources.append((job, resource))
+            identifiers.append(resource.assetLocalIdentifier)
         }
         let fetchResult = PHAsset.fetchAssets(
             withLocalIdentifiers: Array(Set(identifiers)),
@@ -164,9 +191,7 @@ final class BackgroundUploadExtensionCore {
         }
 
         var acknowledgedAny = false
-        for i in 0..<jobs.count where !isCancelled {
-            let job = jobs.object(at: i)
-            let resource = job.resource
+        for (job, resource) in jobResources where !isCancelled {
 
             let resolvedFilename: String
             if let asset = assetsById[resource.assetLocalIdentifier] {
@@ -177,11 +202,20 @@ final class BackgroundUploadExtensionCore {
 
             let resourceType = resourceTypeString(for: resource)
 
+            let immichId: String
+            if #available(iOS 26.4, *),
+               let value = job.responseHeaderFields?[immichAssetIDHeader],
+               UUID(uuidString: value) != nil {
+                immichId = value
+            } else {
+                immichId = "unknown"
+            }
+
             database.recordUploadedAsset(
                 assetId: resource.assetLocalIdentifier,
                 resourceType: resourceType,
                 filename: resolvedFilename,
-                immichId: "unknown",
+                immichId: immichId,
                 fileSize: 0,
                 isDuplicate: false
             )
@@ -228,12 +262,16 @@ final class BackgroundUploadExtensionCore {
             }
         }
 
+        let timezones = captureTimezones(for: resources)
+        guard !isCancelled else { return .deferred }
+
         let library = PHPhotoLibrary.shared()
         var createdAny = false
         try library.performChangesAndWait {
             for resource in resources where !self.isCancelled {
                 guard let dest = self.buildDestination(
                     for: resource,
+                    timezone: timezones[resource.assetLocalIdentifier] ?? TimeZone.current,
                     purpose: .newJob
                 ) else {
                     continue
@@ -314,9 +352,9 @@ final class BackgroundUploadExtensionCore {
     // MARK: - Server Communication
     private func buildDestination(
         for resource: PHAssetResource,
+        timezone: TimeZone,
         purpose: BackgroundUploadPolicy.RequestPurpose = .retry
-    ) -> URLRequest?
-    {
+    ) -> URLRequest? {
         guard !settings.serverURL.isEmpty, !settings.apiKey.isEmpty,
             let url = URL(string: "\(settings.serverURL)/api/assets/background")
         else {
@@ -328,12 +366,12 @@ final class BackgroundUploadExtensionCore {
             return nil
         }
         let resolvedFilename = resource.resolvedFilename(using: asset)
-        
+
         let created = asset.creationDate ?? Date()
         let modified = asset.modificationDate ?? Date()
         let isFavorite = asset.isFavorite
-        
-        let timezone = TimeZone.current
+
+        let timezone = timezone
         let fmt = ISO8601DateFormatter()
         fmt.formatOptions = [.withInternetDateTime, .withTimeZone]
         fmt.timeZone = timezone
@@ -367,6 +405,10 @@ final class BackgroundUploadExtensionCore {
         req.setValue(
             mimeType(for: resource),
             forHTTPHeaderField: "X-Content-Type"
+        )
+        req.setValue(
+            ImageTimezoneOffsetFormatter.string(for: timezone.secondsFromGMT(for: created)),
+            forHTTPHeaderField: "X-Timezone-Offset"
         )
         
         if let iCloudId = getCloudIdentifier(for: asset) {
@@ -420,6 +462,7 @@ final class BackgroundUploadExtensionCore {
         return "primary"
     }
 
+
     private func mimeType(for resource: PHAssetResource) -> String {
         // Use the system UTI registry for accurate MIME type resolution.
         // Substring matching fails for UTIs like "public.hevc" which contain no
@@ -450,6 +493,58 @@ final class BackgroundUploadExtensionCore {
 
         return mapping.first { $0.check(uti) }?.mime
             ?? "application/octet-stream"
+    }
+    private func resource(for job: PHAssetResourceUploadJob) -> PHAssetResource? {
+        if #available(iOS 27.0, *) {
+            return PHAssetResource.assetResource(forUploadJob: job)
+        }
+        return job.resource
+    }
+
+    private func jobErrorDescription(_ job: PHAssetResourceUploadJob) -> String {
+        guard #available(iOS 26.4, *), let error = job.error else {
+            return "unknown error"
+        }
+        let nsError = error as NSError
+        return "\(nsError.domain) \(nsError.code): \(nsError.localizedDescription)"
+    }
+
+
+    private func captureTimezones(for resources: [PHAssetResource]) -> [String: TimeZone] {
+        let fallback = TimeZone.current
+        let identifiers = Array(Set(resources.map(\.assetLocalIdentifier)))
+        let assets = PHAsset.fetchAssets(withLocalIdentifiers: identifiers, options: nil)
+        let group = DispatchGroup()
+        let lock = NSLock()
+        var resolved = Dictionary(uniqueKeysWithValues: identifiers.map { ($0, fallback) })
+        var requests = [MKReverseGeocodingRequest]()
+
+        assets.enumerateObjects { asset, _, _ in
+            guard let location = asset.location,
+                  let request = MKReverseGeocodingRequest(location: location) else {
+                return
+            }
+            requests.append(request)
+            group.enter()
+            request.getMapItems { mapItems, _ in
+                if let timezone = mapItems?.first?.timeZone {
+                    lock.lock()
+                    resolved[asset.localIdentifier] = timezone
+                    lock.unlock()
+                }
+                group.leave()
+            }
+        }
+
+        if group.wait(timeout: .now() + 3) == .timedOut {
+            for request in requests {
+                request.cancel()
+            }
+        }
+        lock.lock()
+        let snapshot = resolved
+        lock.unlock()
+        return snapshot
     }
 
     private func fetchAsset(for resource: PHAssetResource) -> PHAsset? {
@@ -580,5 +675,13 @@ final class LegacyBackgroundUploadExtension: PHBackgroundResourceUploadExtension
 
     func notifyTermination() {
         core.notifyTermination()
+    }
+}
+
+private enum ImageTimezoneOffsetFormatter {
+    static func string(for secondsFromGMT: Int) -> String {
+        let sign = secondsFromGMT < 0 ? "-" : "+"
+        let absoluteSeconds = abs(secondsFromGMT)
+        return String(format: "%@%02d:%02d", sign, absoluteSeconds / 3600, (absoluteSeconds % 3600) / 60)
     }
 }

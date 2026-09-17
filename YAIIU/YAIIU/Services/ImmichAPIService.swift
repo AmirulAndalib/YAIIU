@@ -4,14 +4,15 @@ import UIKit
 
 // MARK: - Mobile App Metadata
 
-struct MobileAppMetadata: Encodable {
-    let iCloudId: String?
-    let createdAt: String?
-    let adjustmentTime: String?
-    let latitude: String?
-    let longitude: String?
-    
-    init(iCloudId: String?, createdAt: Date?, adjustmentTime: Date? = nil, latitude: Double? = nil, longitude: Double? = nil) {
+struct MobileAppMetadata: Codable {
+    var iCloudId: String?
+    var createdAt: String?
+    var adjustmentTime: String?
+    var latitude: String?
+    var longitude: String?
+    var sourceChecksum: String?
+
+    init(iCloudId: String?, createdAt: Date?, adjustmentTime: Date? = nil, latitude: Double? = nil, longitude: Double? = nil, sourceChecksum: String? = nil) {
         self.iCloudId = iCloudId
         
         let formatter = ISO8601DateFormatter()
@@ -21,8 +22,9 @@ struct MobileAppMetadata: Encodable {
         self.adjustmentTime = adjustmentTime.map { formatter.string(from: $0) }
         self.latitude = latitude.map { String($0) }
         self.longitude = longitude.map { String($0) }
+        self.sourceChecksum = sourceChecksum
     }
-    
+
     func encode(to encoder: Encoder) throws {
         var container = encoder.container(keyedBy: CodingKeys.self)
         if let iCloudId = iCloudId { try container.encode(iCloudId, forKey: .iCloudId) }
@@ -30,10 +32,11 @@ struct MobileAppMetadata: Encodable {
         if let adjustmentTime = adjustmentTime { try container.encode(adjustmentTime, forKey: .adjustmentTime) }
         if let latitude = latitude { try container.encode(latitude, forKey: .latitude) }
         if let longitude = longitude { try container.encode(longitude, forKey: .longitude) }
+        if let sourceChecksum = sourceChecksum { try container.encode(sourceChecksum, forKey: .sourceChecksum) }
     }
     
     private enum CodingKeys: String, CodingKey {
-        case iCloudId, createdAt, adjustmentTime, latitude, longitude
+        case iCloudId, createdAt, adjustmentTime, latitude, longitude, sourceChecksum
     }
 }
 
@@ -93,18 +96,45 @@ class ImmichAPIService: NSObject {
             throw CancellationError()
         }
         var ownsPreparedFile = true
+        let originalFileURL: URL
+        do {
+            originalFileURL = try await ResourceFileAccess.tempFile(for: resource)
+        } catch {
+            Self.uploadFileGate.release(1)
+            throw error
+        }
+
         let fileURL: URL
         do {
-            fileURL = try await ResourceFileAccess.tempFile(for: resource)
+            let rewriteTimezone = timezone ?? TimeZone.current
+            fileURL = try await Task.detached(priority: .utility) {
+                try ImageTimezoneMetadata.addingOffsetIfMissing(
+                    to: originalFileURL,
+                    timezone: rewriteTimezone,
+                    at: createdAt
+                )
+            }.value
         } catch {
+            try? FileManager.default.removeItem(at: originalFileURL)
             Self.uploadFileGate.release(1)
             throw error
         }
         defer {
             if ownsPreparedFile {
-                try? FileManager.default.removeItem(at: fileURL)
+                try? FileManager.default.removeItem(at: originalFileURL)
+                if fileURL != originalFileURL {
+                    try? FileManager.default.removeItem(at: fileURL)
+                }
                 Self.uploadFileGate.release(1)
             }
+        }
+        let sourceChecksum: String?
+        if fileURL != originalFileURL {
+            sourceChecksum = try await Task.detached(priority: .utility) {
+                try FileHasher.sha1Hex(ofFileAt: originalFileURL).hash
+            }.value
+        } else {
+            sourceChecksum = nil
         }
         let boundary = UUID().uuidString
 
@@ -123,7 +153,8 @@ class ImmichAPIService: NSObject {
             dateFormatter: dateFormatter,
             iCloudId: iCloudId,
             latitude: latitude,
-            longitude: longitude
+            longitude: longitude,
+            sourceChecksum: sourceChecksum
         )
         let epilogueData = "\r\n--\(boundary)--\r\n".data(using: .utf8)!
 
@@ -206,7 +237,10 @@ class ImmichAPIService: NSObject {
                 into: outputStream,
                 filename: filename,
                 completion: {
-                    try? FileManager.default.removeItem(at: fileURL)
+                    try? FileManager.default.removeItem(at: originalFileURL)
+                    if fileURL != originalFileURL {
+                        try? FileManager.default.removeItem(at: fileURL)
+                    }
                     Self.uploadFileGate.release(1)
                 }
             )
@@ -301,7 +335,8 @@ class ImmichAPIService: NSObject {
         dateFormatter: ISO8601DateFormatter,
         iCloudId: String?,
         latitude: Double?,
-        longitude: Double?
+        longitude: Double?,
+        sourceChecksum: String?
     ) -> Data {
         var body = Data()
 
@@ -317,12 +352,13 @@ class ImmichAPIService: NSObject {
         appendField(name: "fileModifiedAt", value: dateFormatter.string(from: modifiedAt))
         appendField(name: "isFavorite", value: String(isFavorite))
 
-        if let iCloudId = iCloudId {
+        if iCloudId != nil || sourceChecksum != nil {
             let metadata = MobileAppMetadata(
                 iCloudId: iCloudId,
                 createdAt: createdAt,
                 latitude: latitude,
-                longitude: longitude
+                longitude: longitude,
+                sourceChecksum: sourceChecksum
             )
             let item = RemoteAssetMetadataItem(key: RemoteAssetMetadataItem.mobileAppKey, value: metadata)
             if let metadataJSON = try? JSONEncoder().encode([item]),
@@ -937,6 +973,7 @@ class ImmichAPIService: NSObject {
 
     static func parseAssetMetadataStream(_ data: Data) -> AssetMetadataStreamResult {
         var iCloudIdUpserts: [String: String] = [:]
+        var sourceChecksumUpserts: [String: String] = [:]
         var iCloudIdDeletes: Set<String> = []
         var acksByType: [String: String] = [:]
         var state: SyncStreamResultState = .data
@@ -959,13 +996,17 @@ class ImmichAPIService: NSObject {
                     collectLatestAck(from: object, into: &acksByType)
                     continue
                 }
-                guard let iCloudId = value["iCloudId"] as? String,
-                      !iCloudId.isEmpty
-                else {
+                if let iCloudId = value["iCloudId"] as? String, !iCloudId.isEmpty {
+                    iCloudIdUpserts[assetId] = iCloudId
+                    iCloudIdDeletes.remove(assetId)
+                }
+                if let sourceChecksum = value["sourceChecksum"] as? String,
+                   sourceChecksum.range(of: "^[0-9a-fA-F]{40}$", options: .regularExpression) != nil {
+                    sourceChecksumUpserts[assetId] = sourceChecksum.lowercased()
+                }
+                guard iCloudIdUpserts[assetId] != nil || sourceChecksumUpserts[assetId] != nil else {
                     continue
                 }
-                iCloudIdUpserts[assetId] = iCloudId
-                iCloudIdDeletes.remove(assetId)
                 collectLatestAck(from: object, into: &acksByType)
             case "AssetMetadataDeleteV1":
                 guard let eventData = object["data"] as? [String: Any],
@@ -994,6 +1035,7 @@ class ImmichAPIService: NSObject {
 
         return AssetMetadataStreamResult(
             iCloudIdUpserts: iCloudIdUpserts,
+            sourceChecksumUpserts: sourceChecksumUpserts,
             iCloudIdDeletes: iCloudIdDeletes,
             acksByType: acksByType,
             state: state
@@ -1116,10 +1158,7 @@ class ImmichAPIService: NSObject {
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.timeoutInterval = 60
         
-        let body: [String: Any] = [
-            "items": items.map { $0.toDictionary() }
-        ]
-        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        request.httpBody = try JSONEncoder().encode(["items": items])
         
         do {
             let (data, response) = try await URLSession.shared.data(for: request)
@@ -1149,25 +1188,10 @@ struct ImmichAlbum: Decodable {
     let albumName: String
 }
 
-struct MetadataUpdateItem {
+struct MetadataUpdateItem: Encodable {
     let assetId: String
     let key: String
     let value: MobileAppMetadata
-    
-    func toDictionary() -> [String: Any] {
-        var valueDict: [String: Any] = [:]
-        if let iCloudId = value.iCloudId { valueDict["iCloudId"] = iCloudId }
-        if let createdAt = value.createdAt { valueDict["createdAt"] = createdAt }
-        if let adjustmentTime = value.adjustmentTime { valueDict["adjustmentTime"] = adjustmentTime }
-        if let latitude = value.latitude { valueDict["latitude"] = latitude }
-        if let longitude = value.longitude { valueDict["longitude"] = longitude }
-        
-        return [
-            "assetId": assetId,
-            "key": key,
-            "value": valueDict
-        ]
-    }
 }
 
 // MARK: - Error Types
@@ -1252,6 +1276,7 @@ enum SyncStreamResultState {
 
 struct AssetMetadataStreamResult {
     let iCloudIdUpserts: [String: String]
+    let sourceChecksumUpserts: [String: String]
     let iCloudIdDeletes: Set<String>
     let acksByType: [String: String]
     let state: SyncStreamResultState

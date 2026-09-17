@@ -43,6 +43,32 @@ final class ServerAssetRepositoryTests: XCTestCase {
 
         XCTAssertEqual(repository.getServerAssetByChecksum("new")?.iCloudId, "cloud-2")
     }
+    func testAssetDeltaPreservesSourceChecksumWhileUpdatingServerChecksum() {
+        XCTAssertTrue(repository.saveServerAssets([
+            record(checksum: "server-old", sourceChecksum: "original", iCloudId: "cloud-1")
+        ]))
+
+        XCTAssertTrue(repository.saveServerAssets([
+            record(checksum: "server-new", sourceChecksum: nil, iCloudId: nil)
+        ], syncType: "delta"))
+
+        let asset = repository.getServerAssetByImmichId("asset-1")
+        XCTAssertEqual(asset?.checksum, "server-new")
+        XCTAssertEqual(asset?.sourceChecksum, "original")
+        XCTAssertEqual(repository.getServerAssetByChecksum("original")?.immichId, "asset-1")
+    }
+
+    func testSourceChecksumLookupSkipsMissingRowsAndNullChecksums() {
+        XCTAssertTrue(repository.saveServerAssets([
+            record(checksum: "sum-a", sourceChecksum: "original-a", iCloudId: nil),
+            ServerAssetRecord(immichId: "asset-null", checksum: "sum-n", sourceChecksum: nil, originalFilename: nil, assetType: "IMAGE", updatedAt: nil, iCloudId: nil, ownerId: "owner-1")
+        ]))
+
+        let found = repository.sourceChecksums(for: ["asset-1", "asset-null", "asset-missing"])
+
+        XCTAssertEqual(found, ["asset-1": "original-a"])
+    }
+
 
     func testMetadataOnlyUpsertUpdatesExistingAsset() {
         XCTAssertTrue(repository.saveServerAssets([record(checksum: "sum", iCloudId: nil)]))
@@ -173,10 +199,11 @@ final class ServerAssetRepositoryTests: XCTestCase {
         XCTAssertEqual(sqlite3_exec(connection.db, sql, nil, nil, nil), SQLITE_OK)
     }
 
-    private func record(checksum: String, iCloudId: String?) -> ServerAssetRecord {
+    private func record(checksum: String, sourceChecksum: String? = nil, iCloudId: String?) -> ServerAssetRecord {
         ServerAssetRecord(
             immichId: "asset-1",
             checksum: checksum,
+            sourceChecksum: sourceChecksum,
             originalFilename: "photo.jpg",
             assetType: "IMAGE",
             updatedAt: "2026-08-25T00:00:00Z",

@@ -65,6 +65,7 @@ path; resumable uploads are not currently supported.
 | `X-Is-Favorite`      | No       | Whether the asset is a favorite (default: `false`) |
 | `X-Filename`         | No       | Original filename of the asset                     |
 | `X-Content-Type`     | No       | MIME type of the asset                             |
+| `X-Timezone-Offset`  | No       | EXIF offset (`+08:00`) added only when an image lacks `OffsetTimeOriginal` |
 
 ### Request Body
 
@@ -90,6 +91,17 @@ cd immich-proxy
 export IMMICH_SERVER_URL=http://your-immich-server:2283
 go run .
 ```
+
+ExifTool is optional; when it is missing, the proxy logs a warning and forwards uploads with their original metadata instead of failing them.
+
+```bash
+# macOS
+brew install exiftool
+
+# Debian/Ubuntu
+sudo apt install libimage-exiftool-perl
+```
+
 
 ### Using Docker
 

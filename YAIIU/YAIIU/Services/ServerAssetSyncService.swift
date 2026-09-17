@@ -25,12 +25,14 @@ protocol ServerAssetSyncAPI {
 
 protocol ServerAssetSyncStore {
     func isAssetOnServer(checksum: String) -> Bool
+    func getServerAssetByImmichId(_ immichId: String) -> ServerAssetRecord?
     func getSyncMetadata() -> SyncMetadata?
     func clearServerAssetsCache() -> Bool
     func saveServerAssets(_ assets: [ServerAssetRecord], syncType: String) -> Bool
     func deleteServerAssets(_ immichIds: [String]) -> Bool
     func updateICloudIds(_ iCloudIdsByImmichId: [String: String]) -> Bool
     func clearICloudIds(for immichIds: Set<String>) -> Bool
+    func updateSourceChecksums(_ sourceChecksumsByImmichId: [String: String]) -> Bool
     func saveSyncMetadata(lastSyncTime: Date, syncType: String, userId: String, serverURL: String, totalAssets: Int, lastAck: String?) -> Bool
     func getServerAssetsCacheCount() -> Int
     func backfillImmichIdsFromServerCache() -> Int
@@ -233,15 +235,19 @@ class ServerAssetSyncService {
 
         let activeAssets = allAssets.filter { !$0.isDeleted }
         let deletedIds = allAssets.filter { $0.isDeleted }.map { $0.id }
+        let syncType = lastAck == nil ? "full" : "delta"
 
         let serverAssetRecords = activeAssets.compactMap { asset -> ServerAssetRecord? in
-            guard let hexChecksum = convertBase64ToHex(asset.checksum) else {
+            guard let serverChecksum = convertBase64ToHex(asset.checksum) else {
                 logWarning("Failed to convert checksum for asset \(asset.id): \(asset.checksum)", category: .sync)
                 return nil
             }
+            let sourceChecksum = metadataResult.sourceChecksumUpserts[asset.id]
+                ?? (syncType == "delta" ? dbManager.getServerAssetByImmichId(asset.id)?.sourceChecksum : nil)
             return ServerAssetRecord(
                 immichId: asset.id,
-                checksum: hexChecksum,
+                checksum: serverChecksum,
+                sourceChecksum: sourceChecksum,
                 originalFilename: asset.originalFileName,
                 assetType: asset.type,
                 updatedAt: asset.fileCreatedAt,
@@ -255,7 +261,6 @@ class ServerAssetSyncService {
             handler: progressHandler
         )
 
-        let syncType = lastAck == nil ? "full" : "delta"
 
         if syncType == "full", !clearCache() {
             throw SyncError.syncFailed(reason: "Failed to clear server cache before full sync")
@@ -276,6 +281,9 @@ class ServerAssetSyncService {
         }
         guard dbManager.clearICloudIds(for: metadataResult.iCloudIdDeletes) else {
             throw SyncError.syncFailed(reason: "Failed to persist iCloud ID deletions")
+        }
+        guard dbManager.updateSourceChecksums(metadataResult.sourceChecksumUpserts) else {
+            throw SyncError.syncFailed(reason: "Failed to persist source checksum updates")
         }
 
         let acks = Array(Set(streamResult.acks + metadataResult.acks)).sorted()

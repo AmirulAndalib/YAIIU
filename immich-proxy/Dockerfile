@@ -20,8 +20,9 @@ FROM alpine:latest
 
 WORKDIR /app
 
-# Install ca-certificates for HTTPS
-RUN apk --no-cache add ca-certificates
+# Install runtime certificates and the ExifTool CLI for lossless image metadata updates.
+# Note: perl-image-exiftool ships only the Perl modules; the CLI lives in `exiftool`.
+RUN apk --no-cache add ca-certificates exiftool
 
 # Copy the binary from builder
 COPY --from=builder /app/immich-proxy .

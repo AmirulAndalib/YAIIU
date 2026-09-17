@@ -2,6 +2,8 @@ package handlers
 
 import (
 	"bytes"
+	"crypto/sha1"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -59,6 +61,8 @@ type BackgroundUploadRequest struct {
 	ICloudId       string `json:"iCloudId,omitempty"`
 	Latitude       string `json:"latitude,omitempty"`
 	Longitude      string `json:"longitude,omitempty"`
+	TimezoneOffset string `json:"timezoneOffset,omitempty"`
+	SourceChecksum string `json:"-"`
 }
 
 // MobileAppMetadata represents the metadata value for mobile-app key
@@ -68,6 +72,7 @@ type MobileAppMetadata struct {
 	AdjustmentTime string `json:"adjustmentTime,omitempty"`
 	Latitude       string `json:"latitude,omitempty"`
 	Longitude      string `json:"longitude,omitempty"`
+	SourceChecksum string `json:"sourceChecksum,omitempty"`
 }
 
 // RemoteAssetMetadataItem represents a metadata item to send to Immich
@@ -81,6 +86,8 @@ type BackgroundUploadResponse struct {
 	ID        string `json:"id"`
 	Duplicate bool   `json:"duplicate"`
 }
+
+const immichAssetIDHeader = "X-YAIIU-Immich-Asset-Id"
 
 // BackgroundUploadHandler handles the background upload endpoint
 // This endpoint receives raw photo/video data and converts it to
@@ -120,6 +127,8 @@ func BackgroundUploadHandler(immichServerURL string) http.HandlerFunc {
 
 		// Last-resort safety net: if headers are missing or wrong, use magic byte
 		// detection to prevent video payloads from reaching Immich as image/jpeg.
+		// Runs before metadata normalization so a defaulted "upload.jpg" filename
+		// never sends a video payload through the image path.
 		if len(photoData) > 0 &&
 			(metadata.Filename == "upload.jpg" || metadata.ContentType == "application/octet-stream") {
 			detected := http.DetectContentType(photoData)
@@ -137,6 +146,23 @@ func BackgroundUploadHandler(immichServerURL string) http.HandlerFunc {
 				log.Printf("[%s] Magic byte detection overrode metadata: filename=%s contentType=%s",
 					clientIP, metadata.Filename, metadata.ContentType)
 			}
+		}
+
+		// Timezone normalization is best-effort: any failure (including a missing
+		// ExifTool install) forwards the original payload instead of failing the upload.
+		normalizedData, changed, err := addTimezoneOffsetIfMissing(
+			photoData,
+			metadata.Filename,
+			metadata.TimezoneOffset,
+		)
+		if err != nil {
+			log.Printf("[%s] Skipping image timezone normalization: %v", clientIP, err)
+		}
+		if changed {
+			checksum := sha1.Sum(photoData)
+			metadata.SourceChecksum = hex.EncodeToString(checksum[:])
+			photoData = normalizedData
+			log.Printf("[%s] Added EXIF OffsetTimeOriginal=%s", clientIP, metadata.TimezoneOffset)
 		}
 
 		// Create multipart form data for Immich
@@ -186,6 +212,14 @@ func BackgroundUploadHandler(immichServerURL string) http.HandlerFunc {
 		}
 
 		log.Printf("[%s] Immich response status: %d, body: %s", clientIP, resp.StatusCode, string(responseBody))
+		if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
+			var uploadResponse BackgroundUploadResponse
+			if err := json.Unmarshal(responseBody, &uploadResponse); err != nil {
+				log.Printf("[%s] Failed to parse Immich upload response: %v", clientIP, err)
+			} else if uploadResponse.ID != "" {
+				w.Header().Set(immichAssetIDHeader, uploadResponse.ID)
+			}
+		}
 
 		// Copy response headers
 		for key, values := range resp.Header {
@@ -213,6 +247,7 @@ func extractMetadata(r *http.Request) BackgroundUploadRequest {
 		ICloudId:       r.Header.Get("X-iCloud-Id"),
 		Latitude:       r.Header.Get("X-Latitude"),
 		Longitude:      r.Header.Get("X-Longitude"),
+		TimezoneOffset: r.Header.Get("X-Timezone-Offset"),
 	}
 
 	// Fall back to query parameters if headers are not set
@@ -246,6 +281,9 @@ func extractMetadata(r *http.Request) BackgroundUploadRequest {
 	}
 	if metadata.Longitude == "" {
 		metadata.Longitude = query.Get("longitude")
+	}
+	if metadata.TimezoneOffset == "" {
+		metadata.TimezoneOffset = query.Get("timezoneOffset")
 	}
 
 	// Set defaults
@@ -299,15 +337,16 @@ func createMultipartRequest(metadata BackgroundUploadRequest, photoData []byte) 
 		}
 	}
 
-	// Include mobile-app metadata with iCloudId if available
-	if metadata.ICloudId != "" {
+	// Include reconciliation metadata when the upload supplies it.
+	if metadata.ICloudId != "" || metadata.SourceChecksum != "" {
 		metadataItem := RemoteAssetMetadataItem{
 			Key: "mobile-app",
 			Value: MobileAppMetadata{
-				ICloudId:  metadata.ICloudId,
-				CreatedAt: metadata.FileCreatedAt,
-				Latitude:  metadata.Latitude,
-				Longitude: metadata.Longitude,
+				ICloudId:       metadata.ICloudId,
+				CreatedAt:      metadata.FileCreatedAt,
+				Latitude:       metadata.Latitude,
+				Longitude:      metadata.Longitude,
+				SourceChecksum: metadata.SourceChecksum,
 			},
 		}
 		metadataJSON, err := json.Marshal([]RemoteAssetMetadataItem{metadataItem})
