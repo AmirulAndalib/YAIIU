@@ -253,6 +253,72 @@ final class HashPipelinePolicyTests: XCTestCase {
         XCTAssertFalse(state.owns(finalRunID))
     }
 
+    func testDownloadReservationUsesEstimateInsteadOfWholeBudget() {
+        let estimate: Int64 = 12 * 1024 * 1024
+        let reservation = HashPipelinePolicy.downloadReservationBytes(estimatedBytes: estimate, hasUnknownResourceSize: false, budgetBytes: 1_500 * 1024 * 1024)
+
+        XCTAssertEqual(reservation, 64 * 1024 * 1024)
+        XCTAssertLessThan(reservation, 1_500 * 1024 * 1024)
+    }
+
+    func testDownloadReservationKeepsLargerEstimate() {
+        let estimate: Int64 = 240 * 1024 * 1024
+
+        XCTAssertEqual(
+            HashPipelinePolicy.downloadReservationBytes(estimatedBytes: estimate, hasUnknownResourceSize: false, budgetBytes: 1_500 * 1024 * 1024),
+            estimate
+        )
+    }
+
+    func testKnownEstimatedReservationsAllowMultipleDownloadsWithinBudget() async {
+        let budgetBytes: Int64 = 1_500 * 1024 * 1024
+        let budget = ResourceBudget(limit: budgetBytes)
+        let reservation = HashPipelinePolicy.downloadReservationBytes(
+            estimatedBytes: 32 * 1024 * 1024,
+            hasUnknownResourceSize: false,
+            budgetBytes: budgetBytes
+        )
+
+        let first = await budget.acquire(reservation)
+        let second = await budget.acquire(reservation)
+        let third = await budget.acquire(reservation)
+
+        XCTAssertTrue(first)
+        XCTAssertTrue(second)
+        XCTAssertTrue(third)
+
+        budget.release(reservation)
+        budget.release(reservation)
+        budget.release(reservation)
+    }
+
+    func testUnknownSizeReservesWholeBudget() {
+        let budgetBytes: Int64 = 1_500 * 1024 * 1024
+
+        XCTAssertEqual(
+            HashPipelinePolicy.downloadReservationBytes(
+                estimatedBytes: 0,
+                hasUnknownResourceSize: true,
+                budgetBytes: budgetBytes
+            ),
+            budgetBytes
+        )
+    }
+
+    func testPartiallyUnknownResourcesReserveWholeBudget() {
+        let budgetBytes: Int64 = 1_500 * 1024 * 1024
+
+        XCTAssertEqual(
+            HashPipelinePolicy.downloadReservationBytes(
+                estimatedBytes: 20 * 1024 * 1024,
+                hasUnknownResourceSize: true,
+                budgetBytes: budgetBytes
+            ),
+            budgetBytes,
+            "A known JPEG plus unknown RAW must remain serialized"
+        )
+    }
+
     func testBudgetBlocksWhenExhaustedThenAdmitsOnRelease() async {
         let budget = ResourceBudget(limit: 10)
         let first = await budget.acquire(6)
