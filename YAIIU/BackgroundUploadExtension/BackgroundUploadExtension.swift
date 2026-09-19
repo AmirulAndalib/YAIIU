@@ -1,4 +1,5 @@
 import CoreLocation
+import CryptoKit
 import ExtensionFoundation
 import MapKit
 import Network
@@ -98,6 +99,14 @@ final class BackgroundUploadExtensionCore {
             return .completed
         }
 
+        guard let destinationIdentity = currentDestinationIdentity() else {
+            logWarning("Skipping run: upload destination is unavailable")
+            return .completed
+        }
+        if try database.ensureDestinationIdentity(destinationIdentity) {
+            log("Upload destination identity changed or was initialized; restarting PhotoKit bootstrap discovery")
+        }
+
         // Stage markers: the system can terminate the extension at any point
         // without a crash report; per-stage boundaries show how far a run got.
         var madeProgress = timeStage("reconcile") { reconcileTrackedJobs() > 0 }
@@ -160,7 +169,9 @@ final class BackgroundUploadExtensionCore {
 
             let reason: String
             if let identity {
-                if database.isResourceUploaded(
+                if !jobTargetsCurrentDestination(job) {
+                    reason = "upload destination changed"
+                } else if database.isResourceUploaded(
                     assetId: identity.assetLocalIdentifier,
                     resourceType: identity.resourceType
                 ) {
@@ -247,33 +258,68 @@ final class BackgroundUploadExtensionCore {
             logDebug("Retryable jobs: \(jobs.count)")
         }
 
-        var retryResources = [(job: PHAssetResourceUploadJob, resource: PHAssetResource)]()
         for i in 0..<jobs.count where !isCancelled {
             let job = jobs.object(at: i)
-            guard let resource = uploadableResource(for: job) else {
-                logWarning("Skipping retry for job \(job.localIdentifier): resource unavailable; will acknowledge instead")
-                continue
-            }
-            retryResources.append((job, resource))
-        }
-
-        // Rebuild destinations from current settings; job.destination may carry a
-        // stale server URL or credential from before a logout/login or server move.
-        let timezones = captureTimezones(for: retryResources.map(\.resource))
-        guard !isCancelled else { return false }
-
-        for (job, resource) in retryResources where !isCancelled {
             let errorDescription = jobErrorDescription(job)
             logWarning("Retrying failed upload job \(job.localIdentifier): \(errorDescription)")
 
-            guard let destination = buildDestination(
-                for: resource,
-                timezone: timezones[resource.assetLocalIdentifier] ?? TimeZone.current,
-                purpose: .retry
-            ) else {
-                logWarning("Skipping retry for \(resource.originalFilename): destination unavailable")
+            guard let identity = identity(for: job) else {
+                logWarning("Skipping retry for job \(job.localIdentifier): asset identity unavailable")
                 continue
             }
+
+            if !jobTargetsCurrentDestination(job) {
+                if #available(iOS 26.4, *) {
+                    var requested = false
+                    var applied = false
+                    do {
+                        try library.performChangesAndWait {
+                            guard let request = PHAssetResourceUploadJobChangeRequest(for: job) else { return }
+                            request.cancel()
+                            requested = true
+                        }
+                        applied = requested
+                    } catch {
+                        logError("Failed to cancel retry job for old destination \(job.localIdentifier): \(error.localizedDescription)")
+                    }
+                    if applied {
+                        database.deleteTrackedJob(
+                            assetId: identity.assetLocalIdentifier,
+                            resourceType: identity.resourceType
+                        )
+                        retriedAny = true
+                        logWarning("Cancelled retry job \(job.localIdentifier) because upload destination changed")
+                    }
+                } else {
+                    // Early PhotoKit background-upload releases cannot cancel retry
+                    // jobs. Redirect the original resource using its original version
+                    // metadata; acknowledgement will still reject it as stale if the
+                    // PHAsset has been edited since the job was first created.
+                    guard let destination = buildRetryDestination(for: job) else {
+                        logWarning("Skipping old-destination retry \(job.localIdentifier): destination unavailable")
+                        continue
+                    }
+                    do {
+                        try library.performChangesAndWait {
+                            guard let request = PHAssetResourceUploadJobChangeRequest(for: job) else { return }
+                            request.retry(destination: destination)
+                            retriedAny = true
+                        }
+                    } catch {
+                        logError("Failed to redirect retry job \(job.localIdentifier): \(error.localizedDescription)")
+                    }
+                }
+                continue
+            }
+
+            // A retry resends PhotoKit's original resource. Preserve the original
+            // metadata/version headers and only refresh transport settings; rebuilding
+            // from the current PHAsset would make a stale resource look current.
+            guard let destination = buildRetryDestination(for: job) else {
+                logWarning("Skipping retry for job \(job.localIdentifier): destination unavailable")
+                continue
+            }
+
             do {
                 try library.performChangesAndWait {
                     guard let request = PHAssetResourceUploadJobChangeRequest(for: job) else { return }
@@ -306,21 +352,31 @@ final class BackgroundUploadExtensionCore {
                 logWarning("Could not resolve identity for completed job \(job.localIdentifier); acknowledging without recording")
             }
 
+            let currentVersionSucceeded: Bool
+            if succeeded, let identity {
+                currentVersionSucceeded = jobMatchesCurrentAssetState(job, identity: identity)
+                if !currentVersionSucceeded {
+                    logWarning("Completed job \(job.localIdentifier) targets an older asset version; acknowledging without recording")
+                }
+            } else {
+                currentVersionSucceeded = false
+            }
+
             // Capture response data before acknowledging; acknowledgement removes the
             // job from PhotoKit tracking and its fields may become unavailable after.
             let immichId: String?
-            if succeeded, #available(iOS 26.4, *),
+            if currentVersionSucceeded, #available(iOS 26.4, *),
                let value = job.responseHeaderFields?[immichAssetIDHeader],
                UUID(uuidString: value) != nil {
                 immichId = value
             } else {
-                immichId = succeeded ? "unknown" : nil
+                immichId = currentVersionSucceeded ? "unknown" : nil
             }
 
             // Persist a successful upload before releasing the PhotoKit job; the write
             // is idempotent, while a termination between commit and record would lose
             // the upload's durable record.
-            if succeeded, let identity {
+            if currentVersionSucceeded, let identity {
                 database.recordUploadedAsset(
                     assetId: identity.assetLocalIdentifier,
                     resourceType: identity.resourceType,
@@ -351,7 +407,7 @@ final class BackgroundUploadExtensionCore {
             appliedCount += 1
 
             guard let identity else { continue }
-            if succeeded {
+            if currentVersionSucceeded {
                 database.markJobStatus(
                     assetId: identity.assetLocalIdentifier,
                     resourceType: identity.resourceType,
@@ -360,13 +416,16 @@ final class BackgroundUploadExtensionCore {
                 log("Acknowledged successful upload: \(identity.filename)")
             } else {
                 // Delete the tracking row so the resource is immediately rediscoverable;
-                // a failed-status row would keep it classified as inflight while the
-                // PhotoKit job is already gone.
+                // this also covers a successful job for an older asset version.
                 database.deleteTrackedJob(
                     assetId: identity.assetLocalIdentifier,
                     resourceType: identity.resourceType
                 )
-                logWarning("Acknowledged failed upload: \(identity.filename)")
+                if succeeded {
+                    logWarning("Acknowledged stale successful upload: \(identity.filename)")
+                } else {
+                    logWarning("Acknowledged failed upload: \(identity.filename)")
+                }
             }
         }
         return (appliedCount > 0, appliedCount < jobs.count)
@@ -406,12 +465,72 @@ final class BackgroundUploadExtensionCore {
             return .remaining
         }
 
-        // Discover only what a batch needs: a full library scan (per-asset
-        // PHAssetResource.assetResources) outlives the extension's execution
-        // budget and gets the process killed before any job is created.
-        let discovery = fetchPendingResources(limit: max(capacity * 2, 20))
-        logDebug("Found \(discovery.resources.count) pending resources for upload (complete scan: \(discovery.complete))")
+        let persistentMode: Bool
+        var bootstrapTokenData: Data?
+
+        if database.loadChangeToken() != nil {
+            switch try ingestPersistentChanges() {
+            case .ready:
+                persistentMode = true
+            case .requiresBootstrap:
+                // Apple requires a full re-sync after persistent history expires or
+                // can no longer provide complete details. Do that on the next pass.
+                return .remaining
+            case .cancelled:
+                return .deferred
+            }
+        } else {
+            persistentMode = false
+            // Keep the original bootstrap checkpoint across every partial scan. Assets
+            // edited after an early pass must remain newer than this same checkpoint
+            // so persistent history can replay them after the full scan completes.
+            if let savedBootstrapToken = try database.loadBootstrapToken() {
+                bootstrapTokenData = savedBootstrapToken
+            } else {
+                let tokenData = try archiveChangeToken(PHPhotoLibrary.shared().currentChangeToken)
+                try database.saveBootstrapToken(tokenData)
+                bootstrapTokenData = tokenData
+                logDebug("Captured durable PhotoKit bootstrap checkpoint")
+            }
+        }
+
+        let discovery: DiscoveryResult
+        if persistentMode {
+            discovery = try fetchQueuedResources(limit: max(capacity * 2, 20))
+            logDebug("Delta discovery found \(discovery.resources.count) pending resources")
+        } else {
+            // Initial sync / recovery only. Normal invocations never enumerate the
+            // whole photo library once a persistent change token has been established.
+            discovery = fetchPendingResources(limit: max(capacity * 2, 20))
+            logDebug("Bootstrap discovery found \(discovery.resources.count) pending resources (complete scan: \(discovery.complete))")
+        }
+
+        if !persistentMode {
+            // Bootstrap candidates must become durable before the persistent change
+            // checkpoint is advanced. Include currently tracked in-flight assets too:
+            // they may have been created by an earlier build and can later fail or be
+            // cancelled after the full scan starts skipping them.
+            var bootstrapAssetIds = Set(discovery.resources.map(\.assetLocalIdentifier))
+            for key in database.getInflightJobKeys() {
+                if let separator = key.range(of: "||") {
+                    bootstrapAssetIds.insert(String(key[..<separator.lowerBound]))
+                }
+            }
+            try database.enqueueAssets(bootstrapAssetIds)
+
+            if discovery.complete, let bootstrapTokenData {
+                // Every outstanding bootstrap asset is now represented by the durable
+                // queue, so it is safe to switch to persistent-delta mode even if job
+                // creation below is interrupted or an existing job later fails.
+                try database.promoteBootstrapToken(bootstrapTokenData)
+                log("Established PhotoKit persistent change checkpoint from the original bootstrap checkpoint")
+            }
+        }
+
         guard !discovery.resources.isEmpty else {
+            if persistentMode {
+                return discovery.complete ? .completed : .remaining
+            }
             return discovery.complete ? .completed : .remaining
         }
         let resources = discovery.resources
@@ -488,9 +607,99 @@ final class BackgroundUploadExtensionCore {
             }
         }
         guard createdAny else { return .remaining }
+
         // A truncated batch means unscheduled resources remain; the legacy process()
         // path maps .scheduled to .completed, so signal remaining work explicitly.
         return truncated ? .remaining : .scheduled
+    }
+
+    // MARK: - Persistent Photo Library Changes
+
+    private enum PersistentChangeIngestionResult {
+        case ready
+        case requiresBootstrap
+        case cancelled
+    }
+
+    private func archiveChangeToken(_ token: PHPersistentChangeToken) throws -> Data {
+        try NSKeyedArchiver.archivedData(
+            withRootObject: token,
+            requiringSecureCoding: true
+        )
+    }
+
+    private func unarchiveChangeToken(_ data: Data) -> PHPersistentChangeToken? {
+        try? NSKeyedUnarchiver.unarchivedObject(
+            ofClass: PHPersistentChangeToken.self,
+            from: data
+        )
+    }
+
+    /// Copies PhotoKit's durable change history into our app-group queue. Each
+    /// persistent change and its token are committed in one SQLite transaction, so
+    /// termination can cause replay but can never cause a skipped asset.
+    private func ingestPersistentChanges() throws -> PersistentChangeIngestionResult {
+        guard let tokenData = database.loadChangeToken(),
+              let token = unarchiveChangeToken(tokenData) else {
+            database.clearChangeToken()
+            logWarning("Persistent change token could not be decoded; scheduling bootstrap reconciliation")
+            return .requiresBootstrap
+        }
+
+        let library = PHPhotoLibrary.shared()
+
+        do {
+            let changes = try library.fetchPersistentChanges(since: token)
+            var changeCount = 0
+            var insertedCount = 0
+            var updatedCount = 0
+            var deletedCount = 0
+
+            for change in changes {
+                guard !isCancelled else { return .cancelled }
+                let details = try change.changeDetails(for: .asset)
+                let inserted = details.insertedLocalIdentifiers
+                let deleted = details.deletedLocalIdentifiers
+                let updated = details.updatedLocalIdentifiers
+                let nextTokenData = try archiveChangeToken(change.changeToken)
+
+                guard database.commitPersistentChange(
+                    insertedAssetIds: inserted,
+                    updatedAssetIds: updated,
+                    deletedAssetIds: deleted,
+                    tokenData: nextTokenData
+                ) else {
+                    throw NSError(
+                        domain: "com.fawenyo.yaiiu.background-upload",
+                        code: 1,
+                        userInfo: [
+                            NSLocalizedDescriptionKey:
+                                "Failed to atomically persist PhotoKit change history"
+                        ]
+                    )
+                }
+
+                changeCount += 1
+                insertedCount += inserted.count
+                updatedCount += updated.count
+                deletedCount += deleted.count
+            }
+
+            if changeCount > 0 {
+                log("Persistent changes: \(changeCount) batch(es), \(insertedCount) inserted, \(updatedCount) updated, \(deletedCount) deleted")
+            }
+            return isCancelled ? .cancelled : .ready
+        } catch let error as NSError
+            where error.domain == PHPhotosErrorDomain
+            && (
+                error.code == PHPhotosError.persistentChangeTokenExpired.rawValue
+                || error.code == PHPhotosError.persistentChangeDetailsUnavailable.rawValue
+            )
+        {
+            database.clearChangeToken()
+            logWarning("Persistent PhotoKit history is no longer complete; falling back to bootstrap reconciliation")
+            return .requiresBootstrap
+        }
     }
 
     // MARK: - Resource Discovery
@@ -504,6 +713,108 @@ final class BackgroundUploadExtensionCore {
     // Per-run wall-clock budget for library discovery; the system kills the
     // extension without a crash report when a run overruns its execution budget.
     private let discoveryTimeBudget: TimeInterval = 20
+
+    /// Resolves only assets captured by PhotoKit persistent history. The queue entry
+    /// remains until every uploadable resource is confirmed uploaded, making retries
+    /// idempotent without returning to a full-library scan.
+    private func fetchQueuedResources(limit: Int) throws -> DiscoveryResult {
+        let scanLimit = max(limit * 2, 50)
+        let queuedIds = try database.getQueuedAssetIds(limit: scanLimit + 1)
+        let hasMoreQueuedAssets = queuedIds.count > scanLimit
+        let assetIds = Array(queuedIds.prefix(scanLimit))
+        guard !assetIds.isEmpty else {
+            return DiscoveryResult(resources: [], complete: true)
+        }
+
+        let inflightKeys = database.getInflightJobKeys()
+        let fullyOnServer = database.getAllAssetsOnServer()
+        let partial = database.getPartialServerCopyAssets()
+        let fetchResult = PHAsset.fetchAssets(withLocalIdentifiers: assetIds, options: nil)
+
+        var foundIds = Set<String>()
+        var pending = [PHAssetResource]()
+        var stoppedEarly = false
+        let deadline = Date().addingTimeInterval(discoveryTimeBudget)
+
+        fetchResult.enumerateObjects { asset, _, stop in
+            if self.isCancelled || Date() >= deadline {
+                stoppedEarly = true
+                stop.pointee = true
+                return
+            }
+
+            foundIds.insert(asset.localIdentifier)
+
+            guard asset.mediaType == .image || asset.mediaType == .video else {
+                self.database.removeQueuedAsset(asset.localIdentifier)
+                return
+            }
+
+            if fullyOnServer.contains(asset.localIdentifier) {
+                self.database.removeQueuedAsset(asset.localIdentifier)
+                return
+            }
+
+            let resources = PHAssetResource.assetResources(for: asset).filter(self.shouldUpload)
+            var assetHasOutstandingWork = false
+
+            for resource in resources {
+                let type = self.resourceTypeString(for: resource)
+                let key = "\(asset.localIdentifier)||\(type)"
+
+                if inflightKeys.contains(key) {
+                    assetHasOutstandingWork = true
+                    continue
+                }
+
+                let copyOnServer = type == "raw"
+                    ? partial.rawConfirmed.contains(asset.localIdentifier)
+                    : partial.primaryConfirmed.contains(asset.localIdentifier)
+                if copyOnServer {
+                    continue
+                }
+
+                if self.database.isResourceUploaded(
+                    assetId: asset.localIdentifier,
+                    resourceType: type
+                ) {
+                    continue
+                }
+
+                assetHasOutstandingWork = true
+                pending.append(resource)
+            }
+
+            if !assetHasOutstandingWork {
+                self.database.removeQueuedAsset(asset.localIdentifier)
+            }
+
+            // Finish the current asset so JPEG/RAW siblings stay together, then stop
+            // before resolving another queued asset once we have enough candidates.
+            if pending.count >= limit {
+                stoppedEarly = true
+                stop.pointee = true
+            }
+        }
+
+        // A local identifier can be temporarily unresolvable during iCloud restore
+        // or Photos library synchronization. Explicit persistent deletion changes
+        // already remove queue rows, so keep unresolved identifiers durable here.
+        let unresolvedAssetIds = Set(assetIds).subtracting(foundIds)
+        let hasUnresolvedAssets = !unresolvedAssetIds.isEmpty
+        if hasUnresolvedAssets {
+            try database.deferQueuedAssets(unresolvedAssetIds)
+            logDebug("Delta discovery retained and deferred temporarily unresolved queued assets")
+        }
+
+        return DiscoveryResult(
+            resources: pending,
+            // Queue rows covered by live PhotoKit jobs are filtered by the DB query.
+            // Unresolved rows remain pending until Photos can resolve them or emits an
+            // explicit deletion change.
+            complete: !stoppedEarly && !hasMoreQueuedAssets && !hasUnresolvedAssets
+        )
+    }
 
     private func fetchPendingResources(limit: Int) -> DiscoveryResult {
         let skip = database.getAllAssetsOnServer()
@@ -576,14 +887,46 @@ final class BackgroundUploadExtensionCore {
 
 
     // MARK: - Server Communication
+
+    private func currentUploadURL() -> URL? {
+        guard !settings.serverURL.isEmpty else { return nil }
+        return URL(string: "\(settings.serverURL)/api/assets/background")
+    }
+
+    private func currentDestinationIdentity() -> String? {
+        guard let url = currentUploadURL(), !settings.apiKey.isEmpty else { return nil }
+        let material = "\(url.absoluteString)\u{0}\(settings.apiKey)"
+        let digest = SHA256.hash(data: Data(material.utf8))
+        return digest.map { String(format: "%02x", $0) }.joined()
+    }
+
+    private func jobTargetsCurrentDestination(_ job: PHAssetResourceUploadJob) -> Bool {
+        guard let currentURL = currentUploadURL(),
+              let jobURL = job.destination.url,
+              jobURL == currentURL else { return false }
+        return job.destination.value(forHTTPHeaderField: "Authorization")
+            == "Bearer \(settings.apiKey)"
+    }
+
+    private func buildRetryDestination(for job: PHAssetResourceUploadJob) -> URLRequest? {
+        guard let url = currentUploadURL(), !settings.apiKey.isEmpty else { return nil }
+        var request = job.destination
+        request.url = url
+        request.httpMethod = "POST"
+        request.allowsCellularAccess = BackgroundUploadPolicy.allowsCellularAccess(
+            for: .retry,
+            allowCellular: settings.allowCellularBackgroundUpload
+        )
+        request.setValue("Bearer \(settings.apiKey)", forHTTPHeaderField: "Authorization")
+        return request
+    }
+
     private func buildDestination(
         for resource: PHAssetResource,
         timezone: TimeZone,
         purpose: BackgroundUploadPolicy.RequestPurpose = .retry
     ) -> URLRequest? {
-        guard !settings.serverURL.isEmpty, !settings.apiKey.isEmpty,
-            let url = URL(string: "\(settings.serverURL)/api/assets/background")
-        else {
+        guard let url = currentUploadURL(), !settings.apiKey.isEmpty else {
             return nil
         }
 
@@ -790,6 +1133,7 @@ final class BackgroundUploadExtensionCore {
     }
 
     private static let assetExistenceCache = OSAllocatedUnfairLock<Set<String>>(initialState: [])
+    private static let iso8601Formatter = ISO8601DateFormatter()
 
     private static func assetExists(identifier: String) -> Bool {
         // Cache hits only: an asset can be transiently absent during iCloud
@@ -801,6 +1145,44 @@ final class BackgroundUploadExtensionCore {
             assetExistenceCache.withLock { _ = $0.insert(identifier) }
         }
         return exists
+    }
+
+    private func jobMatchesCurrentAssetState(
+        _ job: PHAssetResourceUploadJob,
+        identity: JobIdentity
+    ) -> Bool {
+        guard jobTargetsCurrentDestination(job),
+              let asset = fetchAsset(identifier: identity.assetLocalIdentifier) else {
+            return false
+        }
+
+        if let value = job.destination.value(forHTTPHeaderField: "X-File-Modified-At"),
+           let uploadedDate = Self.iso8601Formatter.date(from: value),
+           let currentDate = asset.modificationDate,
+           abs(uploadedDate.timeIntervalSince(currentDate)) > 1 {
+            return false
+        }
+
+        if let value = job.destination.value(forHTTPHeaderField: "X-Is-Favorite"),
+           value != (asset.isFavorite ? "true" : "false") {
+            return false
+        }
+
+        if let latitude = job.destination.value(forHTTPHeaderField: "X-Latitude"),
+           let longitude = job.destination.value(forHTTPHeaderField: "X-Longitude") {
+            guard let oldLat = Double(latitude),
+                  let oldLong = Double(longitude),
+                  let location = asset.location,
+                  abs(oldLat - location.coordinate.latitude) < 0.0000001,
+                  abs(oldLong - location.coordinate.longitude) < 0.0000001 else {
+                return false
+            }
+        } else if asset.location != nil {
+            // The current asset gained location metadata after this job was created.
+            return false
+        }
+
+        return true
     }
 
     private func uploadableResource(for job: PHAssetResourceUploadJob) -> PHAssetResource? {
@@ -960,9 +1342,9 @@ extension BackgroundUploadExtensionCore {
 
         do {
             switch try processUploadJobs() {
-            case .completed:
+            case .completed, .scheduled:
                 return .completed
-            case .deferred, .remaining, .scheduled:
+            case .deferred, .remaining:
                 return .processing
             }
         } catch let error as NSError
