@@ -253,6 +253,42 @@ final class HashPipelinePolicyTests: XCTestCase {
         XCTAssertFalse(state.owns(finalRunID))
     }
 
+    func testHashPipelineMemoryPressureLimits() {
+        XCTAssertEqual(HashPipelinePolicy.photoKitDownloadWindow, 3)
+        XCTAssertEqual(HashPipelinePolicy.outstandingWorkLimit, 6)
+        XCTAssertEqual(HashPipelinePolicy.diskBudgetBytes, 512 * 1024 * 1024)
+    }
+
+    func testOutstandingWorkGateBlocksPastConfiguredLimit() async {
+        let gate = ResourceBudget(limit: HashPipelinePolicy.outstandingWorkLimit)
+
+        for _ in 0..<Int(HashPipelinePolicy.outstandingWorkLimit) {
+            let acquired = await gate.acquire(1)
+            XCTAssertTrue(acquired)
+        }
+
+        let probe = ConcurrencyProbe()
+        let waiter = Task {
+            if await gate.acquire(1) {
+                await probe.bump()
+                gate.release(1)
+            }
+        }
+
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        let admittedWhileFull = await probe.totalCount
+        XCTAssertEqual(admittedWhileFull, 0, "producer must wait while all outstanding-work slots are occupied")
+
+        gate.release(1)
+        await waiter.value
+        let admittedAfterRelease = await probe.totalCount
+        XCTAssertEqual(admittedAfterRelease, 1)
+
+        for _ in 1..<Int(HashPipelinePolicy.outstandingWorkLimit) {
+            gate.release(1)
+        }
+    }
+
     func testDownloadReservationUsesEstimateInsteadOfWholeBudget() {
         let estimate: Int64 = 12 * 1024 * 1024
         let reservation = HashPipelinePolicy.downloadReservationBytes(estimatedBytes: estimate, hasUnknownResourceSize: false, budgetBytes: 1_500 * 1024 * 1024)
