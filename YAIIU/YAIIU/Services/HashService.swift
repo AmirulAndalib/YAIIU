@@ -243,6 +243,36 @@ final class PreparedWorkRegistry: @unchecked Sendable {
 class HashService {
     static let shared = HashService()
 
+    private final class HashCancellationToken: @unchecked Sendable {
+        private let lock = NSLock()
+        private var cancelled = false
+
+        func cancel() {
+            lock.lock()
+            cancelled = true
+            lock.unlock()
+        }
+
+        var isCancelled: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return cancelled
+        }
+    }
+
+    /// Blocking FileHandle reads must not run on Swift's cooperative executor.
+    /// The outer hash gate also limits work to three assets, while this queue
+    /// provides a global cap across cancellation/restart boundaries.
+    private static let hashWorkerQueue: OperationQueue = {
+        let queue = OperationQueue()
+        queue.name = "com.yaiiu.hash-workers"
+        queue.qualityOfService = .userInitiated
+        queue.maxConcurrentOperationCount = 3
+        return queue
+    }()
+
+    private static let slowQueueDelayThreshold: TimeInterval = 1.0
+
     private static let rawIdentifiers: Set<String> = [
         "raw-image", "dng", "arw", "cr2", "cr3", "nef", "raf", "orf", "rw2"
     ]
@@ -277,18 +307,26 @@ class HashService {
     }
 
     /// Hashes prepared temp files with a bounded read buffer and deletes them.
-    /// File reads run off the cooperative pool so large originals never block it.
+    /// Blocking reads run on the dedicated hash worker queue.
     func hash(_ files: AssetTempFiles) async throws -> MultiResourceHashResult {
         defer { files.removeAll() }
 
         let plan = files.plan
-        let (primaryHash, primarySize) = try await Self.readFileHash(files.primaryFileURL)
+        let (primaryHash, primarySize) = try await Self.readFileHash(
+            files.primaryFileURL,
+            assetIdentifier: plan.localIdentifier,
+            resourceLabel: plan.isRAWOnly ? "raw-primary" : "primary"
+        )
 
         var rawHash: String?
         var rawSize: Int64?
 
         if !plan.isRAWOnly, let rawFileURL = files.rawFileURL {
-            let (hash, size) = try await Self.readFileHash(rawFileURL)
+            let (hash, size) = try await Self.readFileHash(
+                rawFileURL,
+                assetIdentifier: plan.localIdentifier,
+                resourceLabel: "raw"
+            )
             rawHash = hash
             rawSize = Int64(size)
         }
@@ -304,16 +342,66 @@ class HashService {
         )
     }
 
-    /// File hashing on a utility-priority thread, with cancellation forwarded
-    /// so a stopped run abandons large files between chunks.
-    private static func readFileHash(_ url: URL) async throws -> (hash: String, size: Int) {
-        let task = Task.detached(priority: .utility) {
-            try FileHasher.sha1Hex(ofFileAt: url)
-        }
+    /// Runs blocking file I/O + SHA1 on a dedicated bounded worker queue rather
+    /// than Swift's cooperative executor. Cancellation is checked between file
+    /// chunks so stopped runs leave the queue promptly.
+    private static func readFileHash(
+        _ url: URL,
+        assetIdentifier: String,
+        resourceLabel: String
+    ) async throws -> (hash: String, size: Int) {
+        let cancellation = HashCancellationToken()
+
+        logDebug(
+            "Hash resource scheduled: asset=\(assetIdentifier), resource=\(resourceLabel)",
+            category: .hash
+        )
+        let scheduledAt = ProcessInfo.processInfo.systemUptime
+
         return try await withTaskCancellationHandler {
-            try await task.value
+            try await withCheckedThrowingContinuation { continuation in
+                hashWorkerQueue.addOperation {
+                    let workerStartedAt = ProcessInfo.processInfo.systemUptime
+                    let queueDelay = workerStartedAt - scheduledAt
+
+                    if queueDelay >= slowQueueDelayThreshold {
+                        logInfo(
+                            "Hash worker delayed: asset=\(assetIdentifier), resource=\(resourceLabel), queueDelay=\(String(format: "%.3f", queueDelay))s",
+                            category: .hash
+                        )
+                    } else {
+                        logDebug(
+                            "Hash worker started: asset=\(assetIdentifier), resource=\(resourceLabel), queueDelay=\(String(format: "%.3f", queueDelay))s",
+                            category: .hash
+                        )
+                    }
+
+                    do {
+                        if cancellation.isCancelled {
+                            throw CancellationError()
+                        }
+
+                        let hashStartedAt = ProcessInfo.processInfo.systemUptime
+                        let result = try FileHasher.sha1Hex(
+                            ofFileAt: url,
+                            shouldCancel: { cancellation.isCancelled }
+                        )
+                        let hashElapsed = ProcessInfo.processInfo.systemUptime - hashStartedAt
+                        let mebibytes = Double(result.size) / (1024.0 * 1024.0)
+                        let throughput = hashElapsed > 0 ? mebibytes / hashElapsed : 0
+
+                        logDebug(
+                            "Hash resource finished: asset=\(assetIdentifier), resource=\(resourceLabel), bytes=\(result.size), queueDelay=\(String(format: "%.3f", queueDelay))s, hashElapsed=\(String(format: "%.3f", hashElapsed))s, throughput=\(String(format: "%.1f", throughput))MiB/s",
+                            category: .hash
+                        )
+                        continuation.resume(returning: result)
+                    } catch {
+                        continuation.resume(throwing: error)
+                    }
+                }
+            }
         } onCancel: {
-            task.cancel()
+            cancellation.cancel()
         }
     }
 }

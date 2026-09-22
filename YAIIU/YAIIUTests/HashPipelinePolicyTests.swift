@@ -1,3 +1,4 @@
+import Foundation
 import XCTest
 @testable import YAIIU
 
@@ -251,6 +252,103 @@ final class HashPipelinePolicyTests: XCTestCase {
         XCTAssertTrue(state.owns(finalRunID))
         XCTAssertTrue(state.finish(finalRunID))
         XCTAssertFalse(state.owns(finalRunID))
+    }
+
+    func testPhotoKitRateLimitUsesKnownEstimate() {
+        let estimate: Int64 = 42 * 1024 * 1024
+        XCTAssertEqual(
+            HashPipelinePolicy.photoKitRateLimitChargeBytes(
+                estimatedBytes: estimate,
+                hasUnknownResourceSize: false
+            ),
+            estimate
+        )
+    }
+
+    func testPhotoKitRateLimitUsesConservativeUnknownCharge() {
+        XCTAssertEqual(
+            HashPipelinePolicy.photoKitRateLimitChargeBytes(
+                estimatedBytes: 0,
+                hasUnknownResourceSize: true
+            ),
+            HashPipelinePolicy.photoKitUnknownResourceChargeBytes
+        )
+
+        let knownPortion: Int64 = 96 * 1024 * 1024
+        XCTAssertEqual(
+            HashPipelinePolicy.photoKitRateLimitChargeBytes(
+                estimatedBytes: knownPortion,
+                hasUnknownResourceSize: true
+            ),
+            knownPortion
+        )
+    }
+
+    func testPhotoKitRateLimitIsBelowObservedWarningThroughput() {
+        XCTAssertEqual(HashPipelinePolicy.photoKitTargetBytesPerSecond, 24 * 1024 * 1024)
+        XCTAssertLessThan(HashPipelinePolicy.photoKitTargetBytesPerSecond, 58 * 1024 * 1024)
+    }
+
+    func testMemoryPressureThrottleUsesFastPathBeforeWarning() async {
+        let throttle = HashMemoryPressureThrottle()
+
+        let permit = await throttle.acquireIfNeeded()
+
+        XCTAssertEqual(permit, false)
+        XCTAssertFalse(throttle.isThrottled)
+    }
+
+    func testMemoryPressureThrottleSerializesAfterWarning() async {
+        let throttle = HashMemoryPressureThrottle()
+        throttle.signal(cooldown: 0)
+
+        guard let firstPermit = await throttle.acquireIfNeeded() else {
+            return XCTFail("Expected first pressure-mode permit")
+        }
+        XCTAssertTrue(firstPermit)
+        XCTAssertTrue(throttle.isThrottled)
+
+        let probe = ConcurrencyProbe()
+        let waiter = Task {
+            guard let permit = await throttle.acquireIfNeeded() else { return }
+            await probe.bump()
+            throttle.releaseIfNeeded(permit)
+        }
+
+        try? await Task.sleep(nanoseconds: 50_000_000)
+        let admittedWhileHeld = await probe.totalCount
+        XCTAssertEqual(admittedWhileHeld, 0)
+
+        throttle.releaseIfNeeded(firstPermit)
+        await waiter.value
+        let admittedAfterRelease = await probe.totalCount
+        XCTAssertEqual(admittedAfterRelease, 1)
+    }
+
+    func testFileHasherProducesExpectedSHA1WithExplicitCancellationHook() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("hash-test-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        try Data("abc".utf8).write(to: url)
+        let result = try FileHasher.sha1Hex(ofFileAt: url, shouldCancel: { false })
+
+        XCTAssertEqual(result.hash, "a9993e364706816aba3e25717850c26c9cd0d89d")
+        XCTAssertEqual(result.size, 3)
+    }
+
+    func testFileHasherHonorsExplicitCancellationHook() throws {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("hash-cancel-test-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        try Data(repeating: 0xAB, count: 1024).write(to: url)
+
+        XCTAssertThrowsError(
+            try FileHasher.sha1Hex(ofFileAt: url, shouldCancel: { true })
+        ) { error in
+            XCTAssertTrue(error is CancellationError)
+        }
     }
 
     func testHashPipelineMemoryPressureLimits() {
